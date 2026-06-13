@@ -1,0 +1,15 @@
+# binário compilado
+/worker
+/bin/
+
+# env local (segredos)
+.env
+
+# workspace go (conveniência local de IDE; redundante p/ módulo único)
+go.work
+go.work.sum
+
+# artefatos de teste/coverage
+*.out
+*.test
+coverage.html
