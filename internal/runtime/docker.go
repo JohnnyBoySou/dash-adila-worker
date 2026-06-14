@@ -20,7 +20,7 @@ import (
 const labelPrefix = "adila."
 
 // Porta interna do Postgres e do Redis dentro do container.
-const pgContainerPort    = "5432/tcp"
+const pgContainerPort = "5432/tcp"
 const redisContainerPort = "6379/tcp"
 
 // DockerConfig parametriza a implementação Docker.
@@ -37,6 +37,9 @@ type DockerConfig struct {
 	// Range separado evita colisão entre os dois tipos no mesmo host.
 	RedisPortRangeStart int
 	RedisPortRangeEnd   int
+	// AppPortRangeStart/AppPortRangeEnd: range separado para apps (default 40000-49999).
+	AppPortRangeStart int
+	AppPortRangeEnd   int
 }
 
 // Docker implementa ContainerRuntime acionando o CLI `docker` via os/exec.
@@ -70,6 +73,12 @@ func NewDocker(cfg DockerConfig) *Docker {
 	if cfg.RedisPortRangeEnd == 0 {
 		cfg.RedisPortRangeEnd = 39999
 	}
+	if cfg.AppPortRangeStart == 0 {
+		cfg.AppPortRangeStart = 40000
+	}
+	if cfg.AppPortRangeEnd == 0 {
+		cfg.AppPortRangeEnd = 49999
+	}
 	return &Docker{cfg: cfg}
 }
 
@@ -79,6 +88,8 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (*Instance, error) {
 		return d.createForKind(ctx, spec, d.createOrFindPostgres)
 	case KindRedis:
 		return d.createForKind(ctx, spec, d.createOrFindRedis)
+	case KindApp:
+		return d.createForKind(ctx, spec, d.createOrFindApp)
 	default:
 		return nil, fmt.Errorf("kind desconhecido: %s", spec.Kind)
 	}
@@ -330,11 +341,16 @@ func (d *Docker) findByKey(ctx context.Context, key string) (*Instance, error) {
 func (d *Docker) allocatePort(ctx context.Context, kind Kind) (int, error) {
 	var labelKey string
 	var start, end int
-	if kind == KindRedis {
+	switch kind {
+	case KindRedis:
 		labelKey = "redis.hostport"
 		start = d.cfg.RedisPortRangeStart
 		end = d.cfg.RedisPortRangeEnd
-	} else {
+	case KindApp:
+		labelKey = "app.hostport"
+		start = d.cfg.AppPortRangeStart
+		end = d.cfg.AppPortRangeEnd
+	default: // KindPostgres
 		labelKey = "pg.hostport"
 		start = d.cfg.PortRangeStart
 		end = d.cfg.PortRangeEnd
@@ -451,6 +467,9 @@ func buildInstance(insp *dockerInspect) *Instance {
 			insp.NetworkSettings.Ports[redisContainerPort])
 		password = labels[labelPrefix+"redis.password"]
 		// Redis não tem user nem database nomeado (usa índice 0).
+	case KindApp:
+		// Porta lida do label gravado em criação (persiste mesmo com container parado).
+		hostPort = instanceHostPortFromLabel(labels, "app.hostport", nil)
 	default: // KindPostgres (e qualquer kind legado desconhecido)
 		hostPort = instanceHostPortFromLabel(labels, "pg.hostport",
 			insp.NetworkSettings.Ports[pgContainerPort])

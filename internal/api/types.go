@@ -6,12 +6,17 @@ package api
 // createResourceRequest é o corpo de POST /v1/resources.
 // Espelha CreateResourceRequest do TS.
 type createResourceRequest struct {
-	Kind           string          `json:"kind"`           // "postgres" | "redis"
+	Kind           string          `json:"kind"`           // "postgres" | "redis" | "app"
 	IdempotencyKey string          `json:"idempotencyKey"` // dedupe de provision
 	Name           string          `json:"name"`           // slug lógico do service
 	Version        string          `json:"version"`        // tag da imagem (ex.: "16")
 	Region         string          `json:"region"`
 	Limits         *resourceLimits `json:"limits"`
+	// App-specific (kind=app):
+	Image         string            `json:"image"`         // imagem Docker completa (obrigatório para kind=app)
+	Env           map[string]string `json:"env"`           // variáveis de ambiente
+	ContainerPort int               `json:"containerPort"` // porta do container (default 8080)
+	Command       []string          `json:"command"`       // override CMD
 }
 
 // resourceLimits espelha AgentResourceLimits do TS.

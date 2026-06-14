@@ -38,6 +38,9 @@ type Config struct {
 	// Range separado evita colisão entre Postgres e Redis no mesmo host.
 	RedisPortRangeStart int
 	RedisPortRangeEnd   int
+	// AppPortRangeStart/AppPortRangeEnd: range separado para apps (default 40000-49999).
+	AppPortRangeStart int
+	AppPortRangeEnd   int
 	// IdleStopAfter: containers rodando há mais que este tempo são parados automaticamente
 	// (lever de custo: container parado consome ~0 RAM). Zero desabilita (default).
 	IdleStopAfter time.Duration
@@ -72,6 +75,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	appPortStart, err := envInt("AGENT_APP_PORT_RANGE_START", 40000)
+	if err != nil {
+		return Config{}, err
+	}
+	appPortEnd, err := envInt("AGENT_APP_PORT_RANGE_END", 49999)
+	if err != nil {
+		return Config{}, err
+	}
 	idleStop, err := envDuration("AGENT_IDLE_STOP_AFTER", 0)
 	if err != nil {
 		return Config{}, err
@@ -98,6 +109,8 @@ func Load() (Config, error) {
 		PortRangeEnd:        portEnd,
 		RedisPortRangeStart: redisPortStart,
 		RedisPortRangeEnd:   redisPortEnd,
+		AppPortRangeStart:   appPortStart,
+		AppPortRangeEnd:     appPortEnd,
 		IdleStopAfter:       idleStop,
 		BackupInterval:      backupInterval,
 		BackupRetention:     backupRetention,
@@ -119,6 +132,11 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf(
 			"range de portas Redis inválido: AGENT_REDIS_PORT_RANGE_START=%d AGENT_REDIS_PORT_RANGE_END=%d (precisa 1 ≤ start ≤ end ≤ 65535)",
 			cfg.RedisPortRangeStart, cfg.RedisPortRangeEnd)
+	}
+	if cfg.AppPortRangeStart < 1 || cfg.AppPortRangeEnd > 65535 || cfg.AppPortRangeStart > cfg.AppPortRangeEnd {
+		return Config{}, fmt.Errorf(
+			"range de portas App inválido: AGENT_APP_PORT_RANGE_START=%d AGENT_APP_PORT_RANGE_END=%d (precisa 1 ≤ start ≤ end ≤ 65535)",
+			cfg.AppPortRangeStart, cfg.AppPortRangeEnd)
 	}
 	if cfg.BackupInterval > 0 && !cfg.R2Enabled() {
 		return Config{}, fmt.Errorf(

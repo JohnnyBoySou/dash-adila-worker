@@ -21,6 +21,7 @@ type Kind string
 const (
 	KindPostgres Kind = "postgres"
 	KindRedis    Kind = "redis"
+	KindApp      Kind = "app"
 )
 
 // Spec descreve o recurso a provisionar, em termos de domínio (sem detalhes de Docker).
@@ -29,11 +30,17 @@ type Spec struct {
 	ID             string
 	IdempotencyKey string
 	Kind           Kind
-	Name           string  // slug lógico do service (vira label informativo)
-	Version        string  // tag da imagem (ex.: "16" → postgres:16, "7" → redis:7)
+	Name           string // slug lógico do service (vira label informativo)
+	Version        string // tag da imagem (ex.: "16" → postgres:16, "7" → redis:7)
 	Region         string
 	MemoryMb       int     // 0 = sem limite
 	CPUs           float64 // 0 = sem limite
+
+	// App-specific (Kind == KindApp):
+	Image         string            // imagem Docker completa (ex: ghcr.io/user/repo:sha)
+	Env           map[string]string // variáveis de ambiente injetadas no container
+	ContainerPort int               // porta que o container expõe (default 8080)
+	Command       []string          // override do CMD da imagem (opcional)
 }
 
 // Instance é o estado observável de um recurso. O status é SEMÂNTICO — distingue
@@ -45,12 +52,13 @@ type Instance struct {
 	Kind           Kind
 	Name           string
 	Region         string
-	Status         string    // semântico: running/starting/stopped/crashed/unhealthy/...
-	HostPort       int       // porta publicada no host (0 se ainda não atribuída)
-	User           string    // Postgres: "app"; Redis: vazio
+	Status         string // semântico: running/starting/stopped/crashed/unhealthy/...
+	HostPort       int    // porta publicada no host (0 se ainda não atribuída)
+	User           string // Postgres: "app"; Redis: vazio
 	Password       string
 	Database       string    // Postgres: "app"; Redis: vazio (usa índice 0)
 	StartedAt      time.Time // quando o container foi iniciado pela última vez (zero = desconhecido)
+	AppURL         string    // URL pública do app (apenas KindApp)
 }
 
 // ContainerRuntime é o contrato que a camada api usa. Implementações: Docker (real)
