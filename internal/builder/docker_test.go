@@ -42,6 +42,22 @@ func TestParseDigestFromLogs(t *testing.T) {
 	}
 }
 
+func TestParseDigestWithTimestampPrefix(t *testing.T) {
+	const digest = "sha256:abc123def4567890abc123def4567890abc123def4567890abc123def4567890"
+	// Saída de `docker logs --timestamps`: cada linha vem com carimbo RFC3339Nano.
+	logs := "2026-06-20T14:02:30.111Z passo 1...\n" +
+		"2026-06-20T14:02:48.222Z ADILA_IMAGE_DIGEST=" + digest + "\n" +
+		"2026-06-20T14:02:49.333Z fim do push\n"
+
+	m := reDigest.FindStringSubmatch(logs)
+	if m == nil {
+		t.Fatal("digest não encontrado nos logs carimbados")
+	}
+	if m[1] != digest {
+		t.Fatalf("digest = %q, quer %q", m[1], digest)
+	}
+}
+
 func TestParseDigestAbsentReturnsNoMatch(t *testing.T) {
 	logs := "build sem linha-sentinela de digest\n"
 	if m := reDigest.FindStringSubmatch(logs); m != nil {

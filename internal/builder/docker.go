@@ -23,7 +23,10 @@ const labelPrefix = "adila."
 
 // reDigest casa a linha-sentinela que o entrypoint do builder imprime no fim do push
 // (ADILA_IMAGE_DIGEST=sha256:...), de onde lemos o digest sem consultar o registry.
-var reDigest = regexp.MustCompile(`(?m)^ADILA_IMAGE_DIGEST=(sha256:[a-f0-9]{64})\s*$`)
+// O prefixo opcional `(?:\S+\s+)?` tolera o timestamp que `docker logs --timestamps`
+// antepõe a cada linha (ex.: "2026-06-20T14:02:31.123Z ADILA_IMAGE_DIGEST=…"), sem
+// deixar de casar logs antigos sem carimbo.
+var reDigest = regexp.MustCompile(`(?m)^(?:\S+\s+)?ADILA_IMAGE_DIGEST=(sha256:[a-f0-9]{64})\s*$`)
 
 // DockerConfig parametriza a implementação Docker do builder.
 type DockerConfig struct {
@@ -112,8 +115,11 @@ func (d *Docker) Get(ctx context.Context, id string) (*Status, error) {
 		return nil, nil
 	}
 	status := mapBuildState(insp.State.Status, insp.State.ExitCode)
-	// Logs são best-effort: a falha de coleta não invalida o status.
-	logs, _ := d.run(ctx, "logs", name)
+	// Logs são best-effort: a falha de coleta não invalida o status. --timestamps faz
+	// o daemon antepor um carimbo RFC3339Nano (UTC) a cada linha — feito host-side, fora
+	// do container, então sobrevive à troca de rootfs do kaniko (binários internos somem).
+	// O front lê o ISO e converte ao fuso local; o reDigest tolera o prefixo.
+	logs, _ := d.run(ctx, "logs", "--timestamps", name)
 
 	st := &Status{
 		ID:       id,
