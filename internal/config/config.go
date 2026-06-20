@@ -6,6 +6,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -57,6 +58,18 @@ type Config struct {
 	R2Bucket          string
 	R2AccessKeyID     string
 	R2SecretAccessKey string
+	// AppsBaseDomain liga o roteamento público dos apps. Vazio (default) = desligado:
+	// apps publicam só em loopback, como hoje. Preenchido (ex.: "apps.adila.co") faz o
+	// agent registrar <id>.<AppsBaseDomain> no Caddy do host a cada deploy.
+	AppsBaseDomain string
+	// CaddyAppsDir é o diretório dos fragmentos de rota (importado pelo Caddyfile
+	// principal via `import <dir>/*.caddy`). Default "/etc/caddy/apps".
+	CaddyAppsDir string
+	// CaddyfilePath é o Caddyfile principal recarregado após cada mudança de rota.
+	// Default "/etc/caddy/Caddyfile".
+	CaddyfilePath string
+	// CaddyBin é o binário do Caddy usado no reload. Default "caddy".
+	CaddyBin string
 }
 
 // Load lê o ambiente e valida. Erro se Token estiver ausente, ranges de portas
@@ -122,6 +135,10 @@ func Load() (Config, error) {
 		R2Bucket:            os.Getenv("AGENT_R2_BUCKET"),
 		R2AccessKeyID:       os.Getenv("AGENT_R2_ACCESS_KEY_ID"),
 		R2SecretAccessKey:   os.Getenv("AGENT_R2_SECRET_ACCESS_KEY"),
+		AppsBaseDomain:      strings.ToLower(env("AGENT_APPS_BASE_DOMAIN", "")),
+		CaddyAppsDir:        env("AGENT_CADDY_APPS_DIR", "/etc/caddy/apps"),
+		CaddyfilePath:       env("AGENT_CADDYFILE", "/etc/caddy/Caddyfile"),
+		CaddyBin:            env("AGENT_CADDY_BIN", "caddy"),
 	}
 
 	if cfg.Token == "" {
@@ -146,8 +163,22 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf(
 			"AGENT_BACKUP_INTERVAL requer AGENT_R2_ACCOUNT_ID, AGENT_R2_BUCKET, AGENT_R2_ACCESS_KEY_ID e AGENT_R2_SECRET_ACCESS_KEY")
 	}
+	if cfg.AppsBaseDomain != "" && !reDomain.MatchString(cfg.AppsBaseDomain) {
+		return Config{}, fmt.Errorf(
+			"AGENT_APPS_BASE_DOMAIN inválido: %q (esperado um domínio como 'apps.adila.co')", cfg.AppsBaseDomain)
+	}
 
 	return cfg, nil
+}
+
+// reDomain valida AGENT_APPS_BASE_DOMAIN: rótulos DNS minúsculos separados por ponto,
+// com pelo menos dois rótulos. Barra injeção no Caddyfile, já que o domínio compõe
+// um bloco de config (<domínio> { ... }).
+var reDomain = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// RoutingEnabled reporta se o roteamento público de apps está ligado.
+func (c *Config) RoutingEnabled() bool {
+	return c.AppsBaseDomain != ""
 }
 
 // R2Enabled reporta se as credenciais R2 estão completas (todos os quatro campos).

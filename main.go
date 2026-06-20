@@ -18,6 +18,7 @@ import (
 	"github.com/adila/dash/worker/internal/builder"
 	"github.com/adila/dash/worker/internal/config"
 	"github.com/adila/dash/worker/internal/idlestop"
+	"github.com/adila/dash/worker/internal/proxy"
 	"github.com/adila/dash/worker/internal/runtime"
 )
 
@@ -46,13 +47,24 @@ func main() {
 		BuilderImage: cfg.BuilderImage,
 	})
 
+	// Roteamento público dos apps: liga o CaddyRouter só quando AppsBaseDomain está
+	// configurado; caso contrário o NoopRouter (default do Server) mantém o legado.
+	var routerOpts []api.Option
+	if cfg.RoutingEnabled() {
+		log.Info("roteamento público de apps habilitado",
+			"baseDomain", cfg.AppsBaseDomain, "caddyAppsDir", cfg.CaddyAppsDir)
+		router := proxy.NewCaddyRouter(cfg.CaddyAppsDir, cfg.BindHost, cfg.CaddyBin, cfg.CaddyfilePath)
+		routerOpts = append(routerOpts, api.WithRouter(router))
+	}
+
 	srv := api.NewServer(rt, bd, api.Config{
 		Token:               cfg.Token,
 		AdvertiseHost:       cfg.AdvertiseHost,
 		SSLMode:             cfg.SSLMode,
 		DefaultPgVersion:    cfg.DefaultPgVersion,
 		DefaultRedisVersion: cfg.DefaultRedisVersion,
-	}, log)
+		AppsBaseDomain:      cfg.AppsBaseDomain,
+	}, log, routerOpts...)
 
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,

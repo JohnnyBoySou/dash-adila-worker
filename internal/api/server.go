@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/adila/dash/worker/internal/builder"
+	"github.com/adila/dash/worker/internal/proxy"
 	"github.com/adila/dash/worker/internal/runtime"
 )
 
@@ -72,21 +73,43 @@ type Config struct {
 	SSLMode             string // ?sslmode= da connection URL
 	DefaultPgVersion    string // versão Postgres usada quando o request omite
 	DefaultRedisVersion string // versão Redis usada quando o request omite
+	// AppsBaseDomain liga o roteamento público dos apps: vazio = desligado
+	// (URL loopback, comportamento legado); preenchido (ex.: "apps.adila.co") faz
+	// cada app ganhar o domínio <id>.<AppsBaseDomain> e a URL pública vira https://.
+	AppsBaseDomain string
 }
 
 // Server implementa os handlers HTTP do agent.
 type Server struct {
-	rt  runtime.ContainerRuntime
-	bd  builder.Builder
-	cfg Config
-	log *slog.Logger
+	rt     runtime.ContainerRuntime
+	bd     builder.Builder
+	cfg    Config
+	router proxy.Router
+	log    *slog.Logger
 }
 
-func NewServer(rt runtime.ContainerRuntime, bd builder.Builder, cfg Config, log *slog.Logger) *Server {
+// Option configura o Server na construção (functional options).
+type Option func(*Server)
+
+// WithRouter injeta o roteador de proxy usado para publicar apps. Sem ele, o
+// Server usa um NoopRouter (roteamento desligado). Ignora um router nil.
+func WithRouter(r proxy.Router) Option {
+	return func(s *Server) {
+		if r != nil {
+			s.router = r
+		}
+	}
+}
+
+func NewServer(rt runtime.ContainerRuntime, bd builder.Builder, cfg Config, log *slog.Logger, opts ...Option) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{rt: rt, bd: bd, cfg: cfg, log: log}
+	s := &Server{rt: rt, bd: bd, cfg: cfg, router: proxy.NoopRouter{}, log: log}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Handler monta o roteamento (Go 1.22+ ServeMux com método no padrão) e envolve
@@ -149,6 +172,20 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, "create", err)
 		return
 	}
+
+	// Publica o app no Caddy do host (se o roteamento estiver ligado). Falhar aqui
+	// retorna 500 de propósito: o control plane re-tenta e tanto Create quanto Upsert
+	// são idempotentes, então o retry converge — melhor que responder 201 com uma URL
+	// pública que ainda não roteia.
+	if inst.Kind == runtime.KindApp && inst.HostPort > 0 {
+		if domain := s.appDomain(inst); domain != "" {
+			if err := s.router.Upsert(r.Context(), inst.ID, domain, inst.HostPort); err != nil {
+				s.fail(w, "route", err)
+				return
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, s.toResponse(inst))
 }
 
@@ -293,6 +330,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if err := s.rt.Delete(r.Context(), id, destroyData); err != nil {
 		s.fail(w, "delete", err)
 		return
+	}
+	// Remove a rota pública do app (idempotente; no-op se o roteamento estiver
+	// desligado ou o id não for de um app). O prefixo "app-" evita um reload do
+	// Caddy à toa quando se deleta um Postgres/Redis.
+	if strings.HasPrefix(id, "app-") {
+		if err := s.router.Remove(r.Context(), id); err != nil {
+			s.fail(w, "delete-route", err)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -495,9 +541,29 @@ func (s *Server) buildRedisURL(inst *runtime.Instance) string {
 	return u.String()
 }
 
-// buildAppURL monta a URL pública HTTP do app (http://host:port) via net/url.
-// App não tem credencial embutida — o roteamento/proxy externo trata TLS.
+// appDomain devolve o domínio público do app (<id>.<AppsBaseDomain>) quando o
+// roteamento está ligado, ou "" quando desligado. Usa o ID — estável e único por
+// construção — como subdomínio; o Name não é garantidamente único, então evitá-lo
+// no roteamento impede colisão de rotas entre apps homônimos.
+func (s *Server) appDomain(inst *runtime.Instance) string {
+	if s.cfg.AppsBaseDomain == "" {
+		return ""
+	}
+	sub := proxy.Subdomain(inst.ID)
+	if sub == "" {
+		return ""
+	}
+	return sub + "." + s.cfg.AppsBaseDomain
+}
+
+// buildAppURL monta a URL pública do app. Com roteamento ligado, devolve
+// https://<domínio> (o Caddy do host termina o TLS); sem roteamento, cai no
+// http://host:port loopback (comportamento legado). App não tem credencial embutida.
 func (s *Server) buildAppURL(inst *runtime.Instance) string {
+	if domain := s.appDomain(inst); domain != "" {
+		u := url.URL{Scheme: "https", Host: domain}
+		return u.String()
+	}
 	u := url.URL{
 		Scheme: "http",
 		Host:   s.cfg.AdvertiseHost + ":" + strconv.Itoa(inst.HostPort),
