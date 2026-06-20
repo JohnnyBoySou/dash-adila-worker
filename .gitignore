@@ -1,6 +1,10 @@
 # binário compilado
 /worker
 /bin/
+/hetzner-agent
+
+# credenciais do registry self-hosted (geradas na box; NUNCA versionar)
+deploy/registry/.registry-creds
 
 # env local (segredos)
 .env
