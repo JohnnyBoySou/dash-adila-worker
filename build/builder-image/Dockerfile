@@ -25,7 +25,9 @@ RUN apt-get update \
 # nixpacks: gera o Dockerfile a partir do código (autodetecta linguagem/framework).
 # Usamos `nixpacks build --out` (não builda; só emite o Dockerfile) para o kaniko buildar.
 ARG NIXPACKS_VERSION=1.29.1
-RUN curl -sSL https://nixpacks.com/install.sh | bash -s -- --version "${NIXPACKS_VERSION}"
+# O install.sh recebe a versao via env NIXPACKS_VERSION (a flag --version foi
+# removida do instalador); --yes evita o prompt interativo no docker build.
+RUN curl -sSL https://nixpacks.com/install.sh | NIXPACKS_VERSION="${NIXPACKS_VERSION}" bash -s -- --yes
 
 # Executor do kaniko + os diretórios que ele espera (config docker e warmer cache).
 COPY --from=kaniko /kaniko/executor /kaniko/executor

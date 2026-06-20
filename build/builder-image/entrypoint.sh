@@ -52,6 +52,66 @@ if [[ -n "${ADILA_COMMIT_SHA:-}" ]]; then
         || true
 fi
 
+# --- Detecta SPA estática e gera um Dockerfile padrão (servida por nginx na 8080) ---
+# Quando o repo não traz Dockerfile próprio e é um front-end estático (Vite, CRA,
+# Angular, Vue, Astro, Parcel...), o nixpacks falha por não achar "start command".
+# Detectamos o caso pelo package.json e emitimos um Dockerfile padrão que builda os
+# assets e os serve com nginx na porta 8080 (default do agent). O diretório de saída
+# (dist/build/out/...) é descoberto pelo index.html após o build, não adivinhado.
+# Em sucesso, ecoa no stdout o caminho do Dockerfile gerado; senão retorna != 0.
+gen_spa_dockerfile() {
+    local pkg="${SRC}/package.json"
+    [[ -f "${pkg}" ]] || return 1
+    grep -Eq '"build"[[:space:]]*:' "${pkg}" || return 1
+    # "start" indica um servidor de runtime (SSR/API) — aí o nixpacks resolve melhor.
+    grep -Eq '"start"[[:space:]]*:' "${pkg}" && return 1
+    # Precisa de um bundler estático conhecido nas dependências.
+    grep -Eq '"(vite|react-scripts|@angular/cli|@vue/cli-service|vue-cli-service|astro|parcel|@voidzero-dev/vite-plus[a-z-]*)"' "${pkg}" || return 1
+
+    # Package manager pelo lockfile / campo packageManager (default npm).
+    local base preinstall install build_cmd
+    if [[ -f "${SRC}/bun.lock" || -f "${SRC}/bun.lockb" ]] \
+        || grep -Eq '"packageManager"[[:space:]]*:[[:space:]]*"bun@' "${pkg}"; then
+        base="oven/bun:1"; preinstall=""; install="bun install"; build_cmd="bun run build"
+    elif [[ -f "${SRC}/pnpm-lock.yaml" ]]; then
+        base="node:20-slim"; preinstall="RUN corepack enable"; install="pnpm install --frozen-lockfile"; build_cmd="pnpm run build"
+    elif [[ -f "${SRC}/yarn.lock" ]]; then
+        base="node:20-slim"; preinstall="RUN corepack enable"; install="yarn install --frozen-lockfile"; build_cmd="yarn build"
+    else
+        base="node:20-slim"; preinstall=""; install="npm install"; build_cmd="npm run build"
+    fi
+
+    local out="${SRC}/Dockerfile.adila-spa"
+    cat > "${out}" <<'DOCKER'
+# Gerado pelo Adila builder: SPA estática servida por nginx na porta 8080.
+FROM __BASE__ AS build
+WORKDIR /app
+COPY . .
+__PREINSTALL__
+RUN __INSTALL__
+RUN __BUILD__
+# Descobre o diretório de saída estático pelo index.html e normaliza em /site.
+RUN set -e; \
+    for d in dist build out public .output/public dist/spa; do \
+        if [ -f "$d/index.html" ]; then mkdir -p /site && cp -a "$d/." /site/ && break; fi; \
+    done; \
+    [ -f /site/index.html ] || { echo "ERRO: build nao gerou index.html estatico" >&2; exit 1; }
+
+FROM nginx:1.27-alpine
+COPY --from=build /site /usr/share/nginx/html
+RUN printf 'server {\n  listen 8080;\n  root /usr/share/nginx/html;\n  location / { try_files $uri $uri/ /index.html; }\n}\n' > /etc/nginx/conf.d/default.conf
+EXPOSE 8080
+CMD ["nginx", "-g", "daemon off;"]
+DOCKER
+    sed -i \
+        -e "s|__BASE__|${base}|" \
+        -e "s|__PREINSTALL__|${preinstall}|" \
+        -e "s|__INSTALL__|${install}|" \
+        -e "s|__BUILD__|${build_cmd}|" \
+        "${out}"
+    echo "${out}"
+}
+
 # --- Resolve o Dockerfile ---
 if [[ -n "${ADILA_DOCKERFILE:-}" ]]; then
     dockerfile="${SRC}/${ADILA_DOCKERFILE}"
@@ -60,8 +120,11 @@ if [[ -n "${ADILA_DOCKERFILE:-}" ]]; then
 elif [[ -f "${SRC}/Dockerfile" ]]; then
     dockerfile="${SRC}/Dockerfile"
     echo ">> usando Dockerfile do repo (raiz)"
+elif spa_dockerfile=$(gen_spa_dockerfile); then
+    dockerfile="${spa_dockerfile}"
+    echo ">> SPA estática detectada — usando Dockerfile padrão (build + nginx :8080)"
 else
-    echo ">> nenhum Dockerfile — gerando com nixpacks"
+    echo ">> nenhum Dockerfile e não é SPA — gerando com nixpacks"
     # --out grava .nixpacks/Dockerfile SEM buildar (kaniko builda em seguida).
     nixpacks build "${SRC}" --out "${SRC}" >/dev/null \
         || fail "nixpacks não conseguiu gerar o build para este repo"
@@ -90,7 +153,11 @@ echo ">> buildando e empurrando ${ADILA_IMAGE_TARGET}"
     || fail "kaniko falhou ao buildar/empurrar"
 
 # Linha-sentinela consumida pelo agent (reDigest em docker.go).
+# Lemos com o redirecionamento builtin do bash ($(< arquivo)) em vez de `cat`:
+# o kaniko substitui o rootfs do container pela imagem final durante o build, então
+# binários externos (cat, grep...) podem sumir (ex.: imagem final alpine/busybox).
+# Builtins do bash sobrevivem porque já estão carregados no processo.
 if [[ -f /tmp/digest ]]; then
-    echo "ADILA_IMAGE_DIGEST=$(cat /tmp/digest)"
+    echo "ADILA_IMAGE_DIGEST=$(< /tmp/digest)"
 fi
 echo ">> build concluído: ${ADILA_IMAGE_TARGET}"
