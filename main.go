@@ -15,6 +15,7 @@ import (
 
 	"github.com/adila/dash/worker/internal/api"
 	"github.com/adila/dash/worker/internal/backup"
+	"github.com/adila/dash/worker/internal/builder"
 	"github.com/adila/dash/worker/internal/config"
 	"github.com/adila/dash/worker/internal/idlestop"
 	"github.com/adila/dash/worker/internal/runtime"
@@ -36,9 +37,16 @@ func main() {
 		PortRangeEnd:        cfg.PortRangeEnd,
 		RedisPortRangeStart: cfg.RedisPortRangeStart,
 		RedisPortRangeEnd:   cfg.RedisPortRangeEnd,
+		AppPortRangeStart:   cfg.AppPortRangeStart,
+		AppPortRangeEnd:     cfg.AppPortRangeEnd,
 	})
 
-	srv := api.NewServer(rt, api.Config{
+	bd := builder.NewDocker(builder.DockerConfig{
+		Bin:          cfg.DockerBin,
+		BuilderImage: cfg.BuilderImage,
+	})
+
+	srv := api.NewServer(rt, bd, api.Config{
 		Token:               cfg.Token,
 		AdvertiseHost:       cfg.AdvertiseHost,
 		SSLMode:             cfg.SSLMode,

@@ -16,13 +16,19 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/adila/dash/worker/internal/builder"
 	"github.com/adila/dash/worker/internal/runtime"
 )
 
 // Limite do corpo de requisição. O maior DTO (createResourceRequest) tem poucas
 // centenas de bytes; 64 KB é folga de sobra e barra um corpo adversarial gigante.
 const maxBodyBytes = 64 << 10
+
+// maxIdleTimeoutSeconds limita a janela de inatividade do serverless a 24h — barra um
+// valor absurdo que efetivamente desabilitaria o scale-to-zero.
+const maxIdleTimeoutSeconds = 24 * 60 * 60
 
 // Validação dos campos que chegam do control plane e fluem para argumentos do
 // Docker (nome/label/tag de imagem/filtro). exec é por slice (sem shell), então
@@ -36,6 +42,27 @@ var (
 	reSlug = regexp.MustCompile(`^[A-Za-z0-9_.-]{0,64}$`)
 	// version: tag de imagem Docker (ex.: "16", "16.2-alpine").
 	reImageTag = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	// image (kind=app): referência completa (ex.: "ghcr.io/user/repo:sha", "nginx:1.27").
+	// Allowlist sem espaço/`=`/`;`/newline — mesma defesa de borda dos outros campos.
+	reImageRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$`)
+	// env key (kind=app): nome de variável de ambiente estilo shell. O VALOR é livre
+	// (pode ser PEM multilinha, JSON, etc.) — exec por slice torna "KEY=VALUE" seguro.
+	reEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+
+	// --- Validação de borda dos campos de build (POST /v1/builds). Mesma defesa: tudo
+	// que flui para args do `docker run` do container kaniko ou para o entrypoint do
+	// builder passa por allowlist estrita (sem espaço/`;`/newline). ---
+
+	// repoCloneUrl: URL https de clone (sem token embutido — o token vai à parte).
+	reCloneURL = regexp.MustCompile(`^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._/-]{1,200}\.git$`)
+	// gitToken: token efêmero do GitHub App (ex.: ghs_...). Allowlist conservadora.
+	reGitToken = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,255}$`)
+	// ref: branch ou commit; refs git permitem `/`, `.`, `-`, `_`.
+	reGitRef = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,255}$`)
+	// commitSha: hash git (curto ou completo).
+	reCommitSha = regexp.MustCompile(`^[a-f0-9]{7,40}$`)
+	// dockerfile: caminho relativo do Dockerfile no repo.
+	reDockerfilePath = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,200}$`)
 )
 
 // Config é a configuração que o server precisa (subconjunto da config.Config).
@@ -50,15 +77,16 @@ type Config struct {
 // Server implementa os handlers HTTP do agent.
 type Server struct {
 	rt  runtime.ContainerRuntime
+	bd  builder.Builder
 	cfg Config
 	log *slog.Logger
 }
 
-func NewServer(rt runtime.ContainerRuntime, cfg Config, log *slog.Logger) *Server {
+func NewServer(rt runtime.ContainerRuntime, bd builder.Builder, cfg Config, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{rt: rt, cfg: cfg, log: log}
+	return &Server{rt: rt, bd: bd, cfg: cfg, log: log}
 }
 
 // Handler monta o roteamento (Go 1.22+ ServeMux com método no padrão) e envolve
@@ -68,9 +96,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth) // liveness, sem auth
 	mux.HandleFunc("POST /v1/resources", s.requireAuth(s.handleCreate))
 	mux.HandleFunc("GET /v1/resources/{id}", s.requireAuth(s.handleGet))
+	mux.HandleFunc("GET /v1/resources/{id}/metrics", s.requireAuth(s.handleMetrics))
 	mux.HandleFunc("POST /v1/resources/{id}/stop", s.requireAuth(s.handleStop))
 	mux.HandleFunc("POST /v1/resources/{id}/start", s.requireAuth(s.handleStart))
 	mux.HandleFunc("DELETE /v1/resources/{id}", s.requireAuth(s.handleDelete))
+	// Builds (source → imagem) rodam de forma assíncrona: POST lança e devolve 202;
+	// o control plane faz poll em GET até o estado terminal e remove via DELETE.
+	mux.HandleFunc("POST /v1/builds", s.requireAuth(s.handleCreateBuild))
+	mux.HandleFunc("GET /v1/builds/{id}", s.requireAuth(s.handleGetBuild))
+	mux.HandleFunc("DELETE /v1/builds/{id}", s.requireAuth(s.handleDeleteBuild))
 	return mux
 }
 
@@ -104,26 +138,67 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "corpo JSON inválido")
 		return
 	}
-	if !reIdempotencyKey.MatchString(req.IdempotencyKey) {
-		writeError(w, http.StatusBadRequest, "idempotencyKey ausente ou em formato inválido")
+	spec, errMsg := s.specFromRequest(req)
+	if errMsg != "" {
+		writeError(w, http.StatusBadRequest, errMsg)
 		return
+	}
+
+	inst, err := s.rt.Create(r.Context(), spec)
+	if err != nil {
+		s.fail(w, "create", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, s.toResponse(inst))
+}
+
+// specFromRequest valida o corpo e monta o Spec; devolve uma mensagem de erro
+// (string vazia = ok) que a camada HTTP transforma em 400. A validação diverge por
+// kind: postgres/redis usam tag de imagem (version); app usa imagem completa, env
+// e porta do container.
+func (s *Server) specFromRequest(req createResourceRequest) (runtime.Spec, string) {
+	if !reIdempotencyKey.MatchString(req.IdempotencyKey) {
+		return runtime.Spec{}, "idempotencyKey ausente ou em formato inválido"
 	}
 	if !reSlug.MatchString(req.Name) {
-		writeError(w, http.StatusBadRequest, "name em formato inválido")
-		return
+		return runtime.Spec{}, "name em formato inválido"
 	}
 	if !reSlug.MatchString(req.Region) {
-		writeError(w, http.StatusBadRequest, "region em formato inválido")
-		return
+		return runtime.Spec{}, "region em formato inválido"
 	}
 	if req.Kind == "" {
 		req.Kind = string(runtime.KindPostgres)
 	}
 	kind := runtime.Kind(req.Kind)
-	if kind != runtime.KindPostgres && kind != runtime.KindRedis {
-		writeError(w, http.StatusBadRequest, "kind não suportado: "+req.Kind)
-		return
+	if kind != runtime.KindPostgres && kind != runtime.KindRedis && kind != runtime.KindApp {
+		return runtime.Spec{}, "kind não suportado: " + req.Kind
 	}
+
+	if req.IdleTimeoutSeconds < 0 || req.IdleTimeoutSeconds > maxIdleTimeoutSeconds {
+		return runtime.Spec{}, "idleTimeoutSeconds fora do intervalo (0-86400)"
+	}
+
+	spec := runtime.Spec{
+		ID:                 newResourceID(kind),
+		IdempotencyKey:     req.IdempotencyKey,
+		Kind:               kind,
+		Name:               req.Name,
+		Region:             req.Region,
+		Serverless:         req.Serverless,
+		IdleTimeoutSeconds: req.IdleTimeoutSeconds,
+	}
+	if req.Limits != nil {
+		spec.MemoryMb = req.Limits.MemoryMb
+		spec.CPUs = req.Limits.CPUs
+	}
+
+	if kind == runtime.KindApp {
+		if msg := applyAppSpec(&spec, req); msg != "" {
+			return runtime.Spec{}, msg
+		}
+		return spec, ""
+	}
+
 	version := req.Version
 	if version == "" {
 		if kind == runtime.KindRedis {
@@ -133,29 +208,31 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !reImageTag.MatchString(version) {
-		writeError(w, http.StatusBadRequest, "version (tag de imagem) em formato inválido")
-		return
+		return runtime.Spec{}, "version (tag de imagem) em formato inválido"
 	}
+	spec.Version = version
+	return spec, ""
+}
 
-	spec := runtime.Spec{
-		ID:             newResourceID(kind),
-		IdempotencyKey: req.IdempotencyKey,
-		Kind:           kind,
-		Name:           req.Name,
-		Version:        version,
-		Region:         req.Region,
+// applyAppSpec valida e preenche os campos específicos de kind=app no Spec, ou
+// devolve uma mensagem de erro de validação (string vazia = ok).
+func applyAppSpec(spec *runtime.Spec, req createResourceRequest) string {
+	if !reImageRef.MatchString(req.Image) {
+		return "image ausente ou em formato inválido"
 	}
-	if req.Limits != nil {
-		spec.MemoryMb = req.Limits.MemoryMb
-		spec.CPUs = req.Limits.CPUs
+	if req.ContainerPort < 0 || req.ContainerPort > 65535 {
+		return "containerPort fora do intervalo (0-65535)"
 	}
-
-	inst, err := s.rt.Create(r.Context(), spec)
-	if err != nil {
-		s.fail(w, "create", err)
-		return
+	for k := range req.Env {
+		if !reEnvKey.MatchString(k) {
+			return "env contém nome de variável inválido: " + k
+		}
 	}
-	writeJSON(w, http.StatusCreated, s.toResponse(inst))
+	spec.Image = req.Image
+	spec.Env = req.Env
+	spec.ContainerPort = req.ContainerPort
+	spec.Command = req.Command
+	return ""
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -170,6 +247,20 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.toResponse(inst))
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	m, err := s.rt.Metrics(r.Context(), id)
+	if err != nil {
+		s.fail(w, "metrics", err)
+		return
+	}
+	if m == nil {
+		writeError(w, http.StatusNotFound, "recurso não encontrado")
+		return
+	}
+	writeJSON(w, http.StatusOK, toMetricsResponse(m))
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -206,6 +297,117 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleCreateBuild valida o corpo, lança o build assíncrono e responde 202 com o
+// id + status running. NÃO espera a conclusão: um build a frio leva minutos, acima
+// do WriteTimeout do HTTP. O control plane faz poll via GET /v1/builds/{id}.
+func (s *Server) handleCreateBuild(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	var req createBuildRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "corpo JSON inválido")
+		return
+	}
+	spec, errMsg := buildSpecFromRequest(req)
+	if errMsg != "" {
+		writeError(w, http.StatusBadRequest, errMsg)
+		return
+	}
+	if err := s.bd.Start(r.Context(), spec); err != nil {
+		s.fail(w, "build", err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, buildResponse{ID: spec.ID, Status: builder.StatusRunning})
+}
+
+// handleGetBuild devolve o estado atual do build (poll). 404 se não existe.
+func (s *Server) handleGetBuild(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	st, err := s.bd.Get(r.Context(), id)
+	if err != nil {
+		s.fail(w, "build-get", err)
+		return
+	}
+	if st == nil {
+		writeError(w, http.StatusNotFound, "build não encontrado")
+		return
+	}
+	writeJSON(w, http.StatusOK, toBuildResponse(st))
+}
+
+// handleDeleteBuild remove o container de build (idempotente). O control plane chama
+// após consumir o resultado terminal.
+func (s *Server) handleDeleteBuild(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.bd.Delete(r.Context(), id); err != nil {
+		s.fail(w, "build-delete", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// buildSpecFromRequest valida o corpo de build e monta o Spec; devolve uma mensagem
+// de erro (string vazia = ok) que a camada HTTP transforma em 400. Todo campo que
+// flui para args do Docker ou para o entrypoint passa por allowlist estrita.
+func buildSpecFromRequest(req createBuildRequest) (builder.Spec, string) {
+	if !reIdempotencyKey.MatchString(req.IdempotencyKey) {
+		return builder.Spec{}, "idempotencyKey ausente ou em formato inválido"
+	}
+	if !reSlug.MatchString(req.Name) {
+		return builder.Spec{}, "name em formato inválido"
+	}
+	if !reCloneURL.MatchString(req.RepoCloneURL) {
+		return builder.Spec{}, "repoCloneUrl ausente ou em formato inválido"
+	}
+	if req.GitToken != "" && !reGitToken.MatchString(req.GitToken) {
+		return builder.Spec{}, "gitToken em formato inválido"
+	}
+	if !reGitRef.MatchString(req.Ref) {
+		return builder.Spec{}, "ref ausente ou em formato inválido"
+	}
+	if req.CommitSha != "" && !reCommitSha.MatchString(req.CommitSha) {
+		return builder.Spec{}, "commitSha em formato inválido"
+	}
+	if !reImageRef.MatchString(req.ImageTarget) {
+		return builder.Spec{}, "imageTarget ausente ou em formato inválido"
+	}
+	if req.Dockerfile != "" && !reDockerfilePath.MatchString(req.Dockerfile) {
+		return builder.Spec{}, "dockerfile em formato inválido"
+	}
+
+	spec := builder.Spec{
+		ID:             newBuildID(),
+		IdempotencyKey: req.IdempotencyKey,
+		Name:           req.Name,
+		RepoCloneURL:   req.RepoCloneURL,
+		GitToken:       req.GitToken,
+		Ref:            req.Ref,
+		CommitSha:      req.CommitSha,
+		ImageTarget:    req.ImageTarget,
+		Dockerfile:     req.Dockerfile,
+		RegistryAuth: builder.RegistryAuth{
+			Server:   req.Registry.Server,
+			Username: req.Registry.Username,
+			Password: req.Registry.Password,
+		},
+	}
+	if req.Limits != nil {
+		spec.MemoryMb = req.Limits.MemoryMb
+		spec.CPUs = req.Limits.CPUs
+	}
+	return spec, ""
+}
+
+// toBuildResponse mapeia o estado do builder para o DTO.
+func toBuildResponse(st *builder.Status) buildResponse {
+	return buildResponse{
+		ID:       st.ID,
+		Status:   st.Status,
+		ImageRef: st.ImageRef,
+		Digest:   st.Digest,
+		Logs:     st.Logs,
+	}
+}
+
 // toResponse mapeia a instância do runtime para o DTO, montando a connection URL.
 func (s *Server) toResponse(inst *runtime.Instance) resourceResponse {
 	resp := resourceResponse{
@@ -226,6 +428,12 @@ func (s *Server) toResponse(inst *runtime.Instance) resourceResponse {
 				Host: s.cfg.AdvertiseHost,
 				Port: inst.HostPort,
 			}
+		case runtime.KindApp:
+			resp.Connection = &resourceConnection{
+				URL:  s.buildAppURL(inst),
+				Host: s.cfg.AdvertiseHost,
+				Port: inst.HostPort,
+			}
 		default: // Postgres
 			if inst.User != "" {
 				resp.Connection = &resourceConnection{
@@ -239,6 +447,25 @@ func (s *Server) toResponse(inst *runtime.Instance) resourceResponse {
 		}
 	}
 	return resp
+}
+
+// toMetricsResponse mapeia a amostra do runtime para o DTO. CollectedAt vira RFC3339
+// (UTC) para o control plane parsear sem ambiguidade de timezone.
+func toMetricsResponse(m *runtime.Metrics) metricsResponse {
+	return metricsResponse{
+		ID:               m.ID,
+		Kind:             string(m.Kind),
+		Status:           m.Status,
+		CollectedAt:      m.CollectedAt.UTC().Format(time.RFC3339),
+		CPUPercent:       m.CPUPercent,
+		MemoryBytes:      m.MemoryBytes,
+		MemoryLimitBytes: m.MemoryLimitBytes,
+		NetRxBytes:       m.NetRxBytes,
+		NetTxBytes:       m.NetTxBytes,
+		DiskBytes:        m.DiskBytes,
+		Keys:             m.Keys,
+		UptimeSeconds:    m.UptimeSeconds,
+	}
 }
 
 // buildConnectionURL monta postgresql://user:pass@host:port/db?sslmode=… com
@@ -264,6 +491,16 @@ func (s *Server) buildRedisURL(inst *runtime.Instance) string {
 		User:   url.UserPassword("", inst.Password),
 		Host:   s.cfg.AdvertiseHost + ":" + strconv.Itoa(inst.HostPort),
 		Path:   "/0",
+	}
+	return u.String()
+}
+
+// buildAppURL monta a URL pública HTTP do app (http://host:port) via net/url.
+// App não tem credencial embutida — o roteamento/proxy externo trata TLS.
+func (s *Server) buildAppURL(inst *runtime.Instance) string {
+	u := url.URL{
+		Scheme: "http",
+		Host:   s.cfg.AdvertiseHost + ":" + strconv.Itoa(inst.HostPort),
 	}
 	return u.String()
 }
@@ -295,8 +532,22 @@ func newResourceID(kind runtime.Kind) string {
 		panic(fmt.Sprintf("crypto/rand falhou: %v", err))
 	}
 	suffix := hex.EncodeToString(b)
-	if kind == runtime.KindRedis {
+	switch kind {
+	case runtime.KindRedis:
 		return "redis-" + suffix
+	case runtime.KindApp:
+		return "app-" + suffix
+	default:
+		return "pg-" + suffix
 	}
-	return "pg-" + suffix
+}
+
+// newBuildID gera um id único para o build. O prefixo "build-" identifica o kind no
+// nome do container de build (adila-build-<sufixo>) e em logs.
+func newBuildID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("crypto/rand falhou: %v", err))
+	}
+	return "build-" + hex.EncodeToString(b)
 }

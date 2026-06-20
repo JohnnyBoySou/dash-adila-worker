@@ -17,6 +17,10 @@ type Fake struct {
 
 	// FailCreate, se setado, faz Create devolver esse erro (injeção de falha nos testes).
 	FailCreate error
+
+	// metrics guarda overrides por id para Metrics(). Sem override, sintetiza valores
+	// determinísticos. Usado para controlar o sinal de atividade nos testes do idle-stop.
+	metrics map[string]*Metrics
 }
 
 func NewFake() *Fake {
@@ -24,6 +28,7 @@ func NewFake() *Fake {
 		instances: make(map[string]*Instance),
 		byKey:     make(map[string]string),
 		nextPort:  54320,
+		metrics:   make(map[string]*Metrics),
 	}
 }
 
@@ -42,15 +47,17 @@ func (f *Fake) Create(_ context.Context, spec Spec) (*Instance, error) {
 
 	f.nextPort++
 	inst := &Instance{
-		ID:             spec.ID,
-		IdempotencyKey: spec.IdempotencyKey,
-		Kind:           spec.Kind,
-		Name:           spec.Name,
-		Region:         spec.Region,
-		Status:         statusRunning,
-		HostPort:       f.nextPort,
-		Password:       "fake-secret",
-		StartedAt:      time.Now(),
+		ID:                 spec.ID,
+		IdempotencyKey:     spec.IdempotencyKey,
+		Kind:               spec.Kind,
+		Name:               spec.Name,
+		Region:             spec.Region,
+		Status:             statusRunning,
+		HostPort:           f.nextPort,
+		Password:           "fake-secret",
+		StartedAt:          time.Now(),
+		Serverless:         spec.Serverless,
+		IdleTimeoutSeconds: spec.IdleTimeoutSeconds,
 	}
 	// Campos de conexão variam por kind.
 	if spec.Kind == KindPostgres {
@@ -118,6 +125,41 @@ func (f *Fake) ListRunning(_ context.Context) ([]*Instance, error) {
 		}
 	}
 	return result, nil
+}
+
+// SetMetrics injeta um override de métricas para um id (usado pelos testes do idle-stop
+// para simular variação — ou ausência — do sinal de atividade entre varreduras).
+func (f *Fake) SetMetrics(id string, m *Metrics) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := *m
+	f.metrics[id] = &cp
+}
+
+// Metrics devolve o override registrado para o id, ou um snapshot sintético derivado
+// da instância. (nil, nil) se o recurso não existe — espelhando Get.
+func (f *Fake) Metrics(_ context.Context, id string) (*Metrics, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, ok := f.metrics[id]; ok {
+		cp := *m
+		return &cp, nil
+	}
+	inst, ok := f.instances[id]
+	if !ok {
+		return nil, nil
+	}
+	return &Metrics{
+		ID:            inst.ID,
+		Kind:          inst.Kind,
+		Status:        inst.Status,
+		CPUPercent:    1.5,
+		MemoryBytes:   32 * 1024 * 1024,
+		NetRxBytes:    1024,
+		NetTxBytes:    512,
+		UptimeSeconds: 60,
+		CollectedAt:   time.Now(),
+	}, nil
 }
 
 func clone(in *Instance) *Instance {

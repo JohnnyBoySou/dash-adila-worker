@@ -30,6 +30,9 @@ type Config struct {
 	DefaultRedisVersion string
 	// DockerBin é o caminho do binário do Docker.
 	DockerBin string
+	// BuilderImage é a imagem do container de build (git + nixpacks + kaniko) usada
+	// em POST /v1/builds. Default "adila-builder:latest".
+	BuilderImage string
 	// PortRangeStart/PortRangeEnd: range [start,end] de portas para Postgres (default 20000-29999).
 	// Porta FIXA por tenant gravada em label — estável através de stop/start.
 	PortRangeStart int
@@ -105,6 +108,7 @@ func Load() (Config, error) {
 		DefaultPgVersion:    env("AGENT_DEFAULT_PG_VERSION", "16"),
 		DefaultRedisVersion: env("AGENT_DEFAULT_REDIS_VERSION", "7"),
 		DockerBin:           env("AGENT_DOCKER_BIN", "docker"),
+		BuilderImage:        env("AGENT_BUILDER_IMAGE", "adila-builder:latest"),
 		PortRangeStart:      portStart,
 		PortRangeEnd:        portEnd,
 		RedisPortRangeStart: redisPortStart,

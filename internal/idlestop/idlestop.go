@@ -1,6 +1,10 @@
-// Package idlestop para containers gerenciados que ficaram rodando além do limite
-// configurado. É o principal lever de custo da box Hetzner: container parado
+// Package idlestop implementa o scale-to-zero por inatividade dos recursos marcados
+// como serverless. É o principal lever de custo da box Hetzner: container parado
 // consome ~0 RAM e CPU — só o disco do volume é mantido.
+//
+// O sinal de atividade é o contador de bytes recebidos pela rede (docker stats NetIO):
+// um delta zero entre varreduras significa que ninguém falou com o container. Recursos
+// "provisioned" (a maioria) não têm o label serverless e nunca são parados aqui.
 package idlestop
 
 import (
@@ -12,12 +16,22 @@ import (
 )
 
 // checkInterval é o intervalo entre cada varredura de idle. 5 minutos é granular
-// o bastante para reagir a IdleStopAfter de dezenas de minutos sem overload.
+// o bastante para reagir a janelas de inatividade de dezenas de minutos sem overload.
 const checkInterval = 5 * time.Minute
 
-// Run bloqueia até ctx ser cancelado, varrendo a cada checkInterval. Deve ser
-// chamado em goroutine própria (go idlestop.Run(...)).
-func Run(ctx context.Context, rt runtime.ContainerRuntime, idleStopAfter time.Duration, log *slog.Logger) {
+// activity rastreia o último sinal de rede observado de um container serverless e
+// quando ele mudou pela última vez. Mantido em memória entre varreduras — reconstruído
+// na primeira observação após um restart do agent (que nunca dispara stop imediato).
+type activity struct {
+	lastRxBytes  int64
+	lastActiveAt time.Time
+}
+
+// Run bloqueia até ctx ser cancelado, varrendo a cada checkInterval. Deve ser chamado
+// em goroutine própria (go idlestop.Run(...)). defaultIdleAfter é a janela aplicada
+// quando o container não declara um idle.timeout próprio.
+func Run(ctx context.Context, rt runtime.ContainerRuntime, defaultIdleAfter time.Duration, log *slog.Logger) {
+	m := &monitor{rt: rt, defaultIdle: defaultIdleAfter, log: log, state: make(map[string]*activity)}
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 	for {
@@ -25,36 +39,86 @@ func Run(ctx context.Context, rt runtime.ContainerRuntime, idleStopAfter time.Du
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			check(ctx, rt, idleStopAfter, log)
+			m.scan(ctx)
 		}
 	}
 }
 
-// check é a lógica pura de uma varredura: lista os running, para os que
-// ultrapassaram idleStopAfter desde StartedAt.
-func check(ctx context.Context, rt runtime.ContainerRuntime, idleStopAfter time.Duration, log *slog.Logger) {
-	instances, err := rt.ListRunning(ctx)
+// monitor carrega o estado de atividade entre varreduras. Mantido fora de Run para
+// que scan seja testável isoladamente.
+type monitor struct {
+	rt          runtime.ContainerRuntime
+	defaultIdle time.Duration
+	log         *slog.Logger
+	state       map[string]*activity
+}
+
+// scan faz uma varredura: para cada container SERVERLESS rodando, compara o contador
+// de rede com a varredura anterior. Sem variação por toda a janela de inatividade,
+// para o container. Recursos provisioned (não-serverless) são ignorados.
+func (m *monitor) scan(ctx context.Context) {
+	instances, err := m.rt.ListRunning(ctx)
 	if err != nil {
-		log.Error("idle-stop: listar containers rodando", "err", err)
+		m.log.Error("idle-stop: listar containers rodando", "err", err)
 		return
 	}
 	now := time.Now()
+	seen := make(map[string]bool, len(instances))
 	for _, inst := range instances {
-		if inst.StartedAt.IsZero() {
-			// Container sem StartedAt conhecido: ignorar (não parar por segurança).
+		if !inst.Serverless {
+			continue // provisioned: nunca parado automaticamente
+		}
+		seen[inst.ID] = true
+
+		idleAfter := m.defaultIdle
+		if inst.IdleTimeoutSeconds > 0 {
+			idleAfter = time.Duration(inst.IdleTimeoutSeconds) * time.Second
+		}
+
+		mx, err := m.rt.Metrics(ctx, inst.ID)
+		if err != nil {
+			m.log.Error("idle-stop: coletar métricas", "id", inst.ID, "err", err)
 			continue
 		}
-		idle := now.Sub(inst.StartedAt)
-		if idle <= idleStopAfter {
+		if mx == nil {
+			continue // sumiu entre o list e o metrics
+		}
+
+		st := m.state[inst.ID]
+		if st == nil {
+			// Primeira observação: registra baseline e considera ativo agora. Garante
+			// que nunca paramos na primeira varredura nem logo após um restart do agent.
+			m.state[inst.ID] = &activity{lastRxBytes: mx.NetRxBytes, lastActiveAt: now}
 			continue
 		}
-		if err := rt.Stop(ctx, inst.ID); err != nil {
-			log.Error("idle-stop: parar container", "id", inst.ID, "err", err)
+		if mx.NetRxBytes != st.lastRxBytes {
+			// Houve tráfego desde a última varredura → marca como ativo agora.
+			st.lastRxBytes = mx.NetRxBytes
+			st.lastActiveAt = now
 			continue
 		}
-		log.Info("idle-stop: container parado por inatividade",
+
+		idle := now.Sub(st.lastActiveAt)
+		if idle < idleAfter {
+			continue
+		}
+		if err := m.rt.Stop(ctx, inst.ID); err != nil {
+			m.log.Error("idle-stop: parar container", "id", inst.ID, "err", err)
+			continue
+		}
+		m.log.Info("idle-stop: container parado por inatividade",
 			"id", inst.ID,
 			"kind", string(inst.Kind),
 			"idle_for", idle.Round(time.Second).String())
+		// Esquece o estado: ao religar, recomeça com baseline fresco.
+		delete(m.state, inst.ID)
+	}
+
+	// Esquece containers que não estão mais rodando (parados/removidos) para o mapa
+	// de estado não crescer indefinidamente.
+	for id := range m.state {
+		if !seen[id] {
+			delete(m.state, id)
+		}
 	}
 }

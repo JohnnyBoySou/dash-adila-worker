@@ -8,21 +8,28 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/adila/dash/worker/internal/builder"
 	"github.com/adila/dash/worker/internal/runtime"
 )
 
 const testToken = "secret-token"
 
 func newTestServer() (*httptest.Server, *runtime.Fake) {
+	ts, fake, _ := newTestServerWithBuilder()
+	return ts, fake
+}
+
+func newTestServerWithBuilder() (*httptest.Server, *runtime.Fake, *builder.Fake) {
 	fake := runtime.NewFake()
-	srv := NewServer(fake, Config{
+	bd := builder.NewFake()
+	srv := NewServer(fake, bd, Config{
 		Token:               testToken,
 		AdvertiseHost:       "10.0.0.5",
 		SSLMode:             "require",
 		DefaultPgVersion:    "16",
 		DefaultRedisVersion: "7",
 	}, nil)
-	return httptest.NewServer(srv.Handler()), fake
+	return httptest.NewServer(srv.Handler()), fake, bd
 }
 
 func do(t *testing.T, ts *httptest.Server, method, path, token, body string) *http.Response {
@@ -165,6 +172,45 @@ func TestCreateProvisionRedis(t *testing.T) {
 	}
 }
 
+func TestCreateProvisionsApp(t *testing.T) {
+	ts, _ := newTestServer()
+	defer ts.Close()
+
+	resp := do(t, ts, "POST", "/v1/resources", testToken,
+		`{"kind":"app","idempotencyKey":"a1","name":"web-abc","region":"eu","image":"nginx:1.27","containerPort":80,"env":{"FOO":"bar"}}`)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, quer 201", resp.StatusCode)
+	}
+	res := decodeResource(t, resp)
+	if !strings.HasPrefix(res.ID, "app-") {
+		t.Fatalf("id app inesperado: %q (quer prefixo app-)", res.ID)
+	}
+	if res.Kind != "app" {
+		t.Fatalf("kind = %q, quer app", res.Kind)
+	}
+	if res.Status != "running" {
+		t.Fatalf("status = %q, quer running", res.Status)
+	}
+	if res.Connection == nil {
+		t.Fatal("connection ausente")
+	}
+	if !strings.HasPrefix(res.Connection.URL, "http://10.0.0.5:") {
+		t.Fatalf("URL app não começa com http://10.0.0.5: → %q", res.Connection.URL)
+	}
+}
+
+func TestCreateRejectsAppWithoutImage(t *testing.T) {
+	ts, _ := newTestServer()
+	defer ts.Close()
+
+	resp := do(t, ts, "POST", "/v1/resources", testToken,
+		`{"kind":"app","idempotencyKey":"a2","name":"web","region":"eu"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, quer 400", resp.StatusCode)
+	}
+}
+
 // Validação de entrada na borda (achados HIGH-2/HIGH-3/LOW-10): campos que fluem
 // para argumentos do Docker (label/filtro/tag) precisam de allowlist estrita.
 func TestCreateRejectsMalformedInput(t *testing.T) {
@@ -183,6 +229,9 @@ func TestCreateRejectsMalformedInput(t *testing.T) {
 		{"region inválida", `{"idempotencyKey":"k1","name":"svc","region":"eu central"}`},
 		{"version com shell-ish", `{"idempotencyKey":"k1","name":"svc","version":"16; rm -rf"}`},
 		{"version com newline", "{\"idempotencyKey\":\"k1\",\"name\":\"svc\",\"version\":\"16\\nx\"}"},
+		{"image de app com espaço", `{"kind":"app","idempotencyKey":"k1","name":"svc","image":"nginx 1.27"}`},
+		{"env key de app inválida", `{"kind":"app","idempotencyKey":"k1","name":"svc","image":"nginx","env":{"BAD KEY":"v"}}`},
+		{"containerPort fora do range", `{"kind":"app","idempotencyKey":"k1","name":"svc","image":"nginx","containerPort":70000}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

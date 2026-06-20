@@ -1,0 +1,25 @@
+# Caddy como terminador de TLS na frente do registry:2.
+#
+# A autenticação (htpasswd) fica NO registry, não aqui: o kaniko manda um único
+# header Authorization (Basic) no config.json, e o Caddy o repassa intacto. Se o
+# Caddy também pedisse basic auth, haveria conflito de credencial.
+
+{
+	# E-mail do ACME (Let's Encrypt) para avisos de expiração de certificado.
+	email {$ACME_EMAIL}
+}
+
+# Domínio público do registry. O Caddy obtém e renova o cert sozinho — exige que
+# {$REGISTRY_DOMAIN} resolva via DNS para o IP da box e que 80/443 estejam
+# acessíveis a partir da internet (apenas para o desafio ACME e os clientes).
+{$REGISTRY_DOMAIN} {
+	# Streaming de blobs grandes: o reverse_proxy do Caddy não impõe limite de
+	# corpo nem timeout de upload por padrão, então pushes grandes passam.
+	reverse_proxy registry:5000
+
+	# Log de acesso (sem corpo) para auditoria de push/pull.
+	log {
+		output stdout
+		format console
+	}
+}

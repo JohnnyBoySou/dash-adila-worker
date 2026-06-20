@@ -1,0 +1,66 @@
+# Registry privado do Adila (Fase 0) — registry:2 + Caddy (auto-TLS).
+#
+# O kaniko (imagem builder) empurra as imagens aqui e o agent puxa delas no
+# deploy. O Caddy termina TLS automaticamente (Let's Encrypt) para o domínio
+# público REGISTRY_DOMAIN; o registry valida a autenticação via htpasswd.
+#
+# Segurança:
+#  - O registry NUNCA é publicado direto na box: não tem `ports:`. Só o Caddy,
+#    na mesma rede interna do compose, o alcança. Toda entrada passa por TLS.
+#  - Auth é obrigatória (htpasswd bcrypt) — sem push/pull anônimo.
+#  - Os blobs ficam num volume nomeado (sobrevive a recriação dos containers).
+#
+# Subir:  cp .env.example .env && ./gen-htpasswd.sh <user> && docker compose up -d
+name: adila-registry
+
+services:
+  registry:
+    image: registry:2.8.3
+    restart: unless-stopped
+    environment:
+      # Auth htpasswd (bcrypt). kaniko/docker autenticam via HTTP Basic; o
+      # Authorization header passa intacto pelo Caddy até aqui.
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: "Adila Registry"
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      # URLs relativas nos redirects: corretas atrás do proxy que termina TLS.
+      REGISTRY_HTTP_RELATIVEURLS: "true"
+      # Permite DELETE de manifests (pré-requisito do garbage collection).
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      # Segredo que assina o state dos uploads em andamento. Fixo (do .env) p/
+      # não invalidar uploads a cada restart. Gere com `openssl rand -hex 32`.
+      REGISTRY_HTTP_SECRET: ${REGISTRY_HTTP_SECRET:?defina REGISTRY_HTTP_SECRET no .env}
+    volumes:
+      - registry-data:/var/lib/registry
+      - ./auth/htpasswd:/auth/htpasswd:ro
+    networks:
+      - internal
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      - registry
+    # ACME (Let's Encrypt) precisa de 80 (HTTP-01/redirect) e 443 (TLS-ALPN).
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      REGISTRY_DOMAIN: ${REGISTRY_DOMAIN:?defina REGISTRY_DOMAIN no .env}
+      ACME_EMAIL: ${ACME_EMAIL:?defina ACME_EMAIL no .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Persiste certs/chaves do ACME → não re-emite a cada restart (rate limit).
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  registry-data:
+  caddy-data:
+  caddy-config:
