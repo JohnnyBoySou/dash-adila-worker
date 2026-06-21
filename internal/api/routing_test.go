@@ -14,28 +14,34 @@ import (
 )
 
 // fakeRouter registra as chamadas de Upsert/Remove e permite injetar falha, para
-// verificar o wiring do roteamento sem tocar no Caddy real.
+// verificar o wiring do roteamento sem tocar no Caddy real. Guarda o último conjunto
+// de domínios por id para servir Domains (a metadata customDomains lê dele).
 type fakeRouter struct {
 	mu        sync.Mutex
 	upserts   []routeCall
 	removes   []string
+	current   map[string][]string // id -> domínios da rota atual
 	upsertErr error
 	removeErr error
 }
 
 type routeCall struct {
-	id     string
-	domain string
-	port   int
+	id      string
+	domains []string
+	port    int
 }
 
-func (f *fakeRouter) Upsert(_ context.Context, id, domain string, port int) error {
+func (f *fakeRouter) Upsert(_ context.Context, id string, domains []string, port int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.upsertErr != nil {
 		return f.upsertErr
 	}
-	f.upserts = append(f.upserts, routeCall{id, domain, port})
+	f.upserts = append(f.upserts, routeCall{id, domains, port})
+	if f.current == nil {
+		f.current = make(map[string][]string)
+	}
+	f.current[id] = domains
 	return nil
 }
 
@@ -46,7 +52,14 @@ func (f *fakeRouter) Remove(_ context.Context, id string) error {
 		return f.removeErr
 	}
 	f.removes = append(f.removes, id)
+	delete(f.current, id)
 	return nil
+}
+
+func (f *fakeRouter) Domains(_ context.Context, id string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.current[id], nil
 }
 
 // newRoutedServer monta um Server com roteamento ligado (baseDomain) e o fakeRouter.
@@ -87,7 +100,7 @@ func TestCreateAppRegistersRouteAndReturnsHTTPSURL(t *testing.T) {
 		t.Fatalf("esperava 1 Upsert, obteve %d", len(fr.upserts))
 	}
 	call := fr.upserts[0]
-	if call.id != res.ID || call.domain != res.ID+".apps.adila.co" || call.port == 0 {
+	if call.id != res.ID || len(call.domains) != 1 || call.domains[0] != res.ID+".apps.adila.co" || call.port == 0 {
 		t.Fatalf("Upsert chamado com argumentos inesperados: %+v", call)
 	}
 }

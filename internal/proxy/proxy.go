@@ -21,11 +21,16 @@ import (
 
 // Router registra/remove a rota pública de um app.
 type Router interface {
-	// Upsert cria ou atualiza a rota domain -> <bindHost>:port para o app id.
-	// Idempotente: reescrever a mesma rota é seguro.
-	Upsert(ctx context.Context, id, domain string, upstreamPort int) error
+	// Upsert cria ou atualiza a rota domains -> <bindHost>:port para o app id. Um
+	// app pode responder em vários domínios (o subdomínio padrão + domínios custom);
+	// todos compartilham o mesmo upstream num único bloco. Idempotente: reescrever a
+	// mesma rota é seguro.
+	Upsert(ctx context.Context, id string, domains []string, upstreamPort int) error
 	// Remove apaga a rota do app id. Idempotente: rota inexistente é no-op.
 	Remove(ctx context.Context, id string) error
+	// Domains devolve os domínios atualmente roteados para o app id (lidos do
+	// fragmento, que é a fonte de verdade persistente). Lista vazia se não houver rota.
+	Domains(ctx context.Context, id string) ([]string, error)
 }
 
 // NoopRouter é o Router usado quando o roteamento público está desligado
@@ -33,8 +38,9 @@ type Router interface {
 // container em loopback e não toca no Caddy.
 type NoopRouter struct{}
 
-func (NoopRouter) Upsert(context.Context, string, string, int) error { return nil }
-func (NoopRouter) Remove(context.Context, string) error              { return nil }
+func (NoopRouter) Upsert(context.Context, string, []string, int) error { return nil }
+func (NoopRouter) Remove(context.Context, string) error                { return nil }
+func (NoopRouter) Domains(context.Context, string) ([]string, error)   { return nil, nil }
 
 // reSafeID restringe o id a um nome de arquivo seguro — barra path traversal
 // (ex.: "../../etc/...") já que o id compõe o caminho do fragmento. O id real é
@@ -71,15 +77,18 @@ func (r *CaddyRouter) fragmentPath(id string) (string, error) {
 }
 
 // Upsert escreve o fragmento de forma atômica (tmp + rename) e recarrega o Caddy.
-func (r *CaddyRouter) Upsert(ctx context.Context, id, domain string, upstreamPort int) error {
+func (r *CaddyRouter) Upsert(ctx context.Context, id string, domains []string, upstreamPort int) error {
 	path, err := r.fragmentPath(id)
 	if err != nil {
 		return err
 	}
+	if len(domains) == 0 {
+		return fmt.Errorf("nenhum domínio informado para a rota %q", id)
+	}
 	if err := os.MkdirAll(r.appsDir, 0o755); err != nil {
 		return fmt.Errorf("criar diretório de rotas: %w", err)
 	}
-	block := RenderBlock(domain, r.bindHost, upstreamPort)
+	block := RenderBlock(domains, r.bindHost, upstreamPort)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(block), 0o644); err != nil {
 		return fmt.Errorf("escrever fragmento: %w", err)
@@ -89,6 +98,24 @@ func (r *CaddyRouter) Upsert(ctx context.Context, id, domain string, upstreamPor
 		return fmt.Errorf("instalar fragmento: %w", err)
 	}
 	return r.reload(ctx)
+}
+
+// Domains lê o fragmento do app e devolve os domínios roteados (os endereços do
+// bloco Caddy, na ordem). Lista vazia se o fragmento não existir — o fragmento é a
+// fonte de verdade persistente, então isso sobrevive a restart do agent e do Caddy.
+func (r *CaddyRouter) Domains(_ context.Context, id string) ([]string, error) {
+	path, err := r.fragmentPath(id)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("ler fragmento: %w", err)
+	}
+	return ParseDomains(string(data)), nil
 }
 
 // Remove apaga o fragmento do app e recarrega o Caddy. Idempotente.
@@ -106,9 +133,29 @@ func (r *CaddyRouter) Remove(ctx context.Context, id string) error {
 	return r.reload(ctx)
 }
 
-// RenderBlock gera o bloco Caddyfile de um app. Puro e exportado para teste.
-func RenderBlock(domain, upstreamHost string, port int) string {
-	return fmt.Sprintf("%s {\n\treverse_proxy %s:%d\n}\n", domain, upstreamHost, port)
+// RenderBlock gera o bloco Caddyfile de um app. Caddy aceita vários endereços de
+// site separados por vírgula compartilhando a mesma config, então um app com
+// subdomínio padrão + domínios custom vira um único bloco com um upstream. Puro e
+// exportado para teste.
+func RenderBlock(domains []string, upstreamHost string, port int) string {
+	head := strings.Join(domains, ", ")
+	return fmt.Sprintf("%s {\n\treverse_proxy %s:%d\n}\n", head, upstreamHost, port)
+}
+
+// ParseDomains extrai os endereços de site de um bloco gerado por RenderBlock: tudo
+// antes do primeiro '{', separado por vírgula. Inverso de RenderBlock; tolera espaços.
+func ParseDomains(block string) []string {
+	i := strings.IndexByte(block, '{')
+	if i < 0 {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(block[:i], ",") {
+		if d := strings.TrimSpace(part); d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // Subdomain converte um texto livre num label DNS válido (minúsculo, [a-z0-9-],

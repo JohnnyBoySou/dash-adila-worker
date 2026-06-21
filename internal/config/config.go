@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -62,6 +63,10 @@ type Config struct {
 	// apps publicam só em loopback, como hoje. Preenchido (ex.: "apps.adila.co") faz o
 	// agent registrar <id>.<AppsBaseDomain> no Caddy do host a cada deploy.
 	AppsBaseDomain string
+	// AppsPublicIP é o IP público da box para onde os domínios custom devem apontar.
+	// Quando preenchido, ao definir um domínio custom o agent exige que o DNS dele
+	// resolva para este IP antes de registrar a rota. Vazio = só exige que resolva.
+	AppsPublicIP string
 	// CaddyAppsDir é o diretório dos fragmentos de rota (importado pelo Caddyfile
 	// principal via `import <dir>/*.caddy`). Default "/etc/caddy/apps".
 	CaddyAppsDir string
@@ -136,6 +141,7 @@ func Load() (Config, error) {
 		R2AccessKeyID:       os.Getenv("AGENT_R2_ACCESS_KEY_ID"),
 		R2SecretAccessKey:   os.Getenv("AGENT_R2_SECRET_ACCESS_KEY"),
 		AppsBaseDomain:      strings.ToLower(env("AGENT_APPS_BASE_DOMAIN", "")),
+		AppsPublicIP:        strings.TrimSpace(env("AGENT_APPS_PUBLIC_IP", "")),
 		CaddyAppsDir:        env("AGENT_CADDY_APPS_DIR", "/etc/caddy/apps"),
 		CaddyfilePath:       env("AGENT_CADDYFILE", "/etc/caddy/Caddyfile"),
 		CaddyBin:            env("AGENT_CADDY_BIN", "caddy"),
@@ -166,6 +172,10 @@ func Load() (Config, error) {
 	if cfg.AppsBaseDomain != "" && !reDomain.MatchString(cfg.AppsBaseDomain) {
 		return Config{}, fmt.Errorf(
 			"AGENT_APPS_BASE_DOMAIN inválido: %q (esperado um domínio como 'apps.adila.co')", cfg.AppsBaseDomain)
+	}
+	if cfg.AppsPublicIP != "" && net.ParseIP(cfg.AppsPublicIP) == nil {
+		return Config{}, fmt.Errorf(
+			"AGENT_APPS_PUBLIC_IP inválido: %q (esperado um IP como '46.225.134.88')", cfg.AppsPublicIP)
 	}
 
 	return cfg, nil

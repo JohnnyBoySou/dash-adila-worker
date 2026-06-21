@@ -23,6 +23,13 @@ type createResourceRequest struct {
 	Command       []string          `json:"command"`       // override CMD
 }
 
+// setDomainsRequest é o corpo de PUT /v1/resources/{id}/domains. Define a lista
+// COMPLETA de domínios próprios do app (replace); o subdomínio padrão é sempre
+// mantido pelo agent. Lista vazia limpa os domínios custom.
+type setDomainsRequest struct {
+	Domains []string `json:"domains"`
+}
+
 // resourceLimits espelha AgentResourceLimits do TS.
 type resourceLimits struct {
 	MemoryMb int     `json:"memoryMb"`
@@ -96,6 +103,18 @@ type buildResponse struct {
 	ImageRef string `json:"imageRef,omitempty"` // imagem produzida (só em succeeded)
 	Digest   string `json:"digest,omitempty"`   // sha256:... (só em succeeded)
 	Logs     string `json:"logs,omitempty"`     // saída do build (best-effort)
+}
+
+// logLineResponse é uma linha de log de runtime. Espelha AgentLogLine do TS.
+type logLineResponse struct {
+	Timestamp string `json:"timestamp,omitempty"` // RFC3339Nano (UTC); vazio se desconhecido
+	Message   string `json:"message"`
+}
+
+// logsResponse é o corpo de GET /v1/resources/{id}/logs. Espelha AgentLogs do TS —
+// as linhas de log de runtime do workload (não há segredo; é a saída do container).
+type logsResponse struct {
+	Lines []logLineResponse `json:"lines"`
 }
 
 // errorBody é o corpo de erro. O cliente TS lê `error` (fallback `message`).

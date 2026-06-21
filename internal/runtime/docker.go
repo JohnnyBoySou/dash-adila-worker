@@ -621,6 +621,99 @@ func (d *Docker) run(ctx context.Context, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
+// runCombined roda o docker com stdout e stderr no MESMO buffer. Para `docker logs`,
+// o stdout do container vem no stdout do comando e o stderr do container no stderr —
+// escrevê-los num único buffer preserva a ordem de chegada (o os/exec detecta
+// Stdout==Stderr e serializa as escritas, então não há corrida no bytes.Buffer).
+// Depois reordenamos por carimbo de tempo para corrigir qualquer interleaving.
+func (d *Docker) runCombined(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, d.cfg.Bin, args...)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Run(); err != nil {
+		return buf.String(), fmt.Errorf("%v: %s", err, strings.TrimSpace(buf.String()))
+	}
+	return buf.String(), nil
+}
+
+// defaultLogTail/maxLogTail limitam quantas linhas `docker logs` devolve. O default
+// cobre o caso comum (acompanhamento ao vivo na interface) e o teto barra um dump
+// gigante que estouraria memória/resposta.
+const (
+	defaultLogTail = 500
+	maxLogTail     = 2000
+)
+
+// Logs coleta as linhas de log de runtime do container via `docker logs --timestamps`.
+// Confere a existência antes (inspect) para distinguir "não existe" (ErrNotFound) de
+// "existe mas sem logs" ([]). As linhas vêm ordenadas por carimbo de tempo.
+func (d *Docker) Logs(ctx context.Context, id string, opts LogOptions) ([]LogLine, error) {
+	name := containerName(id)
+	insp, err := d.inspect(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if insp == nil {
+		return nil, ErrNotFound
+	}
+
+	tail := opts.Tail
+	if tail <= 0 {
+		tail = defaultLogTail
+	}
+	if tail > maxLogTail {
+		tail = maxLogTail
+	}
+
+	args := []string{"logs", "--timestamps", "--tail", strconv.Itoa(tail)}
+	if !opts.Since.IsZero() {
+		args = append(args, "--since", opts.Since.UTC().Format(time.RFC3339Nano))
+	}
+	args = append(args, name)
+
+	out, err := d.runCombined(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return parseLogLines(out), nil
+}
+
+// parseLogLines separa cada linha "<RFC3339Nano> <mensagem>" da saída de
+// `docker logs --timestamps` e ordena por carimbo de tempo (corrige o interleaving
+// entre stdout e stderr). Uma linha sem carimbo parseável entra com Timestamp zero e
+// a mensagem inteira preservada.
+func parseLogLines(out string) []LogLine {
+	out = strings.TrimRight(out, "\n")
+	if out == "" {
+		return nil
+	}
+	raw := strings.Split(out, "\n")
+	lines := make([]LogLine, 0, len(raw))
+	for _, r := range raw {
+		ts, msg := splitLogTimestamp(r)
+		lines = append(lines, LogLine{Timestamp: ts, Message: msg})
+	}
+	sort.SliceStable(lines, func(i, j int) bool {
+		return lines[i].Timestamp.Before(lines[j].Timestamp)
+	})
+	return lines
+}
+
+// splitLogTimestamp separa o carimbo RFC3339Nano do início da linha. Devolve
+// (zero, linha) quando não há carimbo parseável.
+func splitLogTimestamp(line string) (time.Time, string) {
+	sp := strings.IndexByte(line, ' ')
+	if sp <= 0 {
+		return time.Time{}, line
+	}
+	ts, err := time.Parse(time.RFC3339Nano, line[:sp])
+	if err != nil {
+		return time.Time{}, line
+	}
+	return ts, line[sp+1:]
+}
+
 // --- helpers ---
 
 // portBinding é um bind publicado de uma porta do container (HostIp:HostPort).

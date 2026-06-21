@@ -10,10 +10,35 @@ import (
 )
 
 func TestRenderBlock(t *testing.T) {
-	got := RenderBlock("app-abc.apps.adila.co", "127.0.0.1", 40123)
+	got := RenderBlock([]string{"app-abc.apps.adila.co"}, "127.0.0.1", 40123)
 	want := "app-abc.apps.adila.co {\n\treverse_proxy 127.0.0.1:40123\n}\n"
 	if got != want {
 		t.Fatalf("bloco gerado divergente:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestRenderBlockMultiplosDominios(t *testing.T) {
+	got := RenderBlock([]string{"app-abc.apps.adila.co", "lp.adila.co", "www.lp.adila.co"}, "127.0.0.1", 40123)
+	want := "app-abc.apps.adila.co, lp.adila.co, www.lp.adila.co {\n\treverse_proxy 127.0.0.1:40123\n}\n"
+	if got != want {
+		t.Fatalf("bloco multi-domínio divergente:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestParseDomainsInverteRenderBlock(t *testing.T) {
+	domains := []string{"app-abc.apps.adila.co", "lp.adila.co", "www.lp.adila.co"}
+	block := RenderBlock(domains, "127.0.0.1", 40123)
+	got := ParseDomains(block)
+	if len(got) != len(domains) {
+		t.Fatalf("ParseDomains devolveu %d domínios, quer %d: %v", len(got), len(domains), got)
+	}
+	for i := range domains {
+		if got[i] != domains[i] {
+			t.Fatalf("domínio %d = %q, quer %q", i, got[i], domains[i])
+		}
+	}
+	if ParseDomains("sem chave nenhuma") != nil {
+		t.Fatal("bloco sem '{' deveria devolver nil")
 	}
 }
 
@@ -41,7 +66,7 @@ func TestSubdomain(t *testing.T) {
 
 func TestNoopRouter(t *testing.T) {
 	var r Router = NoopRouter{}
-	if err := r.Upsert(context.Background(), "app-x", "x.apps.adila.co", 8080); err != nil {
+	if err := r.Upsert(context.Background(), "app-x", []string{"x.apps.adila.co"}, 8080); err != nil {
 		t.Fatalf("Upsert noop: %v", err)
 	}
 	if err := r.Remove(context.Background(), "app-x"); err != nil {
@@ -69,7 +94,7 @@ func newTestRouter(t *testing.T) (*CaddyRouter, *int) {
 func TestCaddyRouterUpsertWritesFragmentAndReloads(t *testing.T) {
 	r, reloads := newTestRouter(t)
 
-	if err := r.Upsert(context.Background(), "app-abc", "app-abc.apps.adila.co", 40123); err != nil {
+	if err := r.Upsert(context.Background(), "app-abc", []string{"app-abc.apps.adila.co"}, 40123); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 
@@ -78,7 +103,7 @@ func TestCaddyRouterUpsertWritesFragmentAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ler fragmento: %v", err)
 	}
-	want := RenderBlock("app-abc.apps.adila.co", "127.0.0.1", 40123)
+	want := RenderBlock([]string{"app-abc.apps.adila.co"}, "127.0.0.1", 40123)
 	if string(data) != want {
 		t.Fatalf("conteúdo do fragmento divergente:\n got: %q\nwant: %q", data, want)
 	}
@@ -96,11 +121,11 @@ func TestCaddyRouterUpsertIsIdempotent(t *testing.T) {
 	r, reloads := newTestRouter(t)
 	ctx := context.Background()
 
-	if err := r.Upsert(ctx, "app-abc", "app-abc.apps.adila.co", 1111); err != nil {
+	if err := r.Upsert(ctx, "app-abc", []string{"app-abc.apps.adila.co"}, 1111); err != nil {
 		t.Fatalf("primeiro Upsert: %v", err)
 	}
 	// Reescrever a mesma rota (porta nova) deve sobrescrever sem erro.
-	if err := r.Upsert(ctx, "app-abc", "app-abc.apps.adila.co", 2222); err != nil {
+	if err := r.Upsert(ctx, "app-abc", []string{"app-abc.apps.adila.co"}, 2222); err != nil {
 		t.Fatalf("segundo Upsert: %v", err)
 	}
 
@@ -116,11 +141,37 @@ func TestCaddyRouterUpsertIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestCaddyRouterDomainsLeFragmento(t *testing.T) {
+	r, _ := newTestRouter(t)
+	ctx := context.Background()
+
+	// Sem fragmento, a lista é vazia (não é erro).
+	got, err := r.Domains(ctx, "app-abc")
+	if err != nil {
+		t.Fatalf("Domains sem fragmento: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("esperava nil sem fragmento, obteve %v", got)
+	}
+
+	domains := []string{"app-abc.apps.adila.co", "lp.adila.co"}
+	if err := r.Upsert(ctx, "app-abc", domains, 40123); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	got, err = r.Domains(ctx, "app-abc")
+	if err != nil {
+		t.Fatalf("Domains: %v", err)
+	}
+	if len(got) != 2 || got[0] != domains[0] || got[1] != domains[1] {
+		t.Fatalf("Domains = %v, quer %v", got, domains)
+	}
+}
+
 func TestCaddyRouterRemove(t *testing.T) {
 	r, reloads := newTestRouter(t)
 	ctx := context.Background()
 
-	if err := r.Upsert(ctx, "app-abc", "app-abc.apps.adila.co", 40123); err != nil {
+	if err := r.Upsert(ctx, "app-abc", []string{"app-abc.apps.adila.co"}, 40123); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 	if err := r.Remove(ctx, "app-abc"); err != nil {
@@ -151,7 +202,7 @@ func TestCaddyRouterUpsertPropagatesReloadError(t *testing.T) {
 	sentinel := errors.New("reload explodiu")
 	r.reload = func(context.Context) error { return sentinel }
 
-	err := r.Upsert(context.Background(), "app-abc", "app-abc.apps.adila.co", 40123)
+	err := r.Upsert(context.Background(), "app-abc", []string{"app-abc.apps.adila.co"}, 40123)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("erro do reload deveria propagar; obteve: %v", err)
 	}
@@ -168,7 +219,7 @@ func TestNewCaddyRouterReloadInvokesBinary(t *testing.T) {
 	dir := t.TempDir()
 	r := NewCaddyRouter(filepath.Join(dir, "apps"), "127.0.0.1", "caddy-que-nao-existe-xyz", filepath.Join(dir, "Caddyfile"))
 
-	err := r.Upsert(context.Background(), "app-abc", "app-abc.apps.adila.co", 40123)
+	err := r.Upsert(context.Background(), "app-abc", []string{"app-abc.apps.adila.co"}, 40123)
 	if err == nil {
 		t.Fatal("esperava erro do reload com binário inexistente")
 	}
@@ -187,7 +238,7 @@ func TestCaddyRouterRejectsUnsafeID(t *testing.T) {
 
 	bad := []string{"../../etc/caddy/Caddyfile", "a/b", "with space", ""}
 	for _, id := range bad {
-		if err := r.Upsert(ctx, id, "x.apps.adila.co", 8080); err == nil {
+		if err := r.Upsert(ctx, id, []string{"x.apps.adila.co"}, 8080); err == nil {
 			t.Fatalf("Upsert deveria rejeitar id inseguro %q", id)
 		}
 		if err := r.Remove(ctx, id); err == nil {

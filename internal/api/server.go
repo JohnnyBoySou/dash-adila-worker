@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -50,6 +52,11 @@ var (
 	// (pode ser PEM multilinha, JSON, etc.) — exec por slice torna "KEY=VALUE" seguro.
 	reEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 
+	// customDomain: domínio próprio que o usuário aponta para a box (ex.: "lp.adila.co",
+	// "exemplo.com"). Rótulos DNS minúsculos separados por ponto, ≥2 rótulos. Mesma
+	// defesa de borda do AppsBaseDomain — o domínio compõe um bloco do Caddyfile.
+	reCustomDomain = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
 	// --- Validação de borda dos campos de build (POST /v1/builds). Mesma defesa: tudo
 	// que flui para args do `docker run` do container kaniko ou para o entrypoint do
 	// builder passa por allowlist estrita (sem espaço/`;`/newline). ---
@@ -77,6 +84,11 @@ type Config struct {
 	// (URL loopback, comportamento legado); preenchido (ex.: "apps.adila.co") faz
 	// cada app ganhar o domínio <id>.<AppsBaseDomain> e a URL pública vira https://.
 	AppsBaseDomain string
+	// AppsPublicIP é o IP público da box para onde os domínios custom devem apontar.
+	// Quando preenchido, ao definir um domínio custom o agent exige que o DNS dele
+	// resolva para este IP (barra registrar rota que o Caddy não conseguiria emitir
+	// cert via ACME). Vazio = só exige que o domínio resolva para algum endereço.
+	AppsPublicIP string
 }
 
 // Server implementa os handlers HTTP do agent.
@@ -86,6 +98,9 @@ type Server struct {
 	cfg    Config
 	router proxy.Router
 	log    *slog.Logger
+	// resolveHost resolve um host em endereços IP. Injetável para teste; em produção
+	// usa o resolver do sistema. Usado na pré-validação de DNS dos domínios custom.
+	resolveHost func(ctx context.Context, host string) ([]string, error)
 }
 
 // Option configura o Server na construção (functional options).
@@ -105,7 +120,8 @@ func NewServer(rt runtime.ContainerRuntime, bd builder.Builder, cfg Config, log 
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{rt: rt, bd: bd, cfg: cfg, router: proxy.NoopRouter{}, log: log}
+	s := &Server{rt: rt, bd: bd, cfg: cfg, router: proxy.NoopRouter{}, log: log,
+		resolveHost: net.DefaultResolver.LookupHost}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -120,9 +136,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/resources", s.requireAuth(s.handleCreate))
 	mux.HandleFunc("GET /v1/resources/{id}", s.requireAuth(s.handleGet))
 	mux.HandleFunc("GET /v1/resources/{id}/metrics", s.requireAuth(s.handleMetrics))
+	mux.HandleFunc("GET /v1/resources/{id}/logs", s.requireAuth(s.handleLogs))
 	mux.HandleFunc("POST /v1/resources/{id}/stop", s.requireAuth(s.handleStop))
 	mux.HandleFunc("POST /v1/resources/{id}/start", s.requireAuth(s.handleStart))
 	mux.HandleFunc("DELETE /v1/resources/{id}", s.requireAuth(s.handleDelete))
+	// Domínios custom de um app: define a lista completa de domínios próprios que
+	// passam a rotear para o app (além do subdomínio padrão), com TLS automático.
+	mux.HandleFunc("PUT /v1/resources/{id}/domains", s.requireAuth(s.handleSetDomains))
 	// Builds (source → imagem) rodam de forma assíncrona: POST lança e devolve 202;
 	// o control plane faz poll em GET até o estado terminal e remove via DELETE.
 	mux.HandleFunc("POST /v1/builds", s.requireAuth(s.handleCreateBuild))
@@ -179,14 +199,14 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// pública que ainda não roteia.
 	if inst.Kind == runtime.KindApp && inst.HostPort > 0 {
 		if domain := s.appDomain(inst); domain != "" {
-			if err := s.router.Upsert(r.Context(), inst.ID, domain, inst.HostPort); err != nil {
+			if err := s.router.Upsert(r.Context(), inst.ID, []string{domain}, inst.HostPort); err != nil {
 				s.fail(w, "route", err)
 				return
 			}
 		}
 	}
 
-	writeJSON(w, http.StatusCreated, s.toResponse(inst))
+	writeJSON(w, http.StatusCreated, s.toResponse(r.Context(), inst))
 }
 
 // specFromRequest valida o corpo e monta o Spec; devolve uma mensagem de erro
@@ -283,7 +303,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "recurso não encontrado")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.toResponse(inst))
+	writeJSON(w, http.StatusOK, s.toResponse(r.Context(), inst))
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -298,6 +318,67 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toMetricsResponse(m))
+}
+
+// maxLogTail limita o `tail` aceito na query — espelha o teto do runtime, rejeitando
+// na borda um pedido absurdo antes de tocar o Docker.
+const maxLogTailQuery = 2000
+
+// handleLogs devolve as linhas de log de runtime do workload (poll sob demanda pela
+// interface). 404 se o recurso não existe. Os parâmetros de query `tail` (nº de
+// linhas) e `since` (RFC3339) são opcionais e validados na borda.
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	opts, errMsg := logOptionsFromQuery(r.URL.Query())
+	if errMsg != "" {
+		writeError(w, http.StatusBadRequest, errMsg)
+		return
+	}
+	lines, err := s.rt.Logs(r.Context(), id, opts)
+	if err != nil {
+		if errors.Is(err, runtime.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "recurso não encontrado")
+			return
+		}
+		s.fail(w, "logs", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toLogsResponse(lines))
+}
+
+// logOptionsFromQuery parseia e valida os parâmetros de query de logs. Devolve as
+// opções e uma mensagem de erro (string vazia = ok) que a camada HTTP vira 400.
+func logOptionsFromQuery(q url.Values) (runtime.LogOptions, string) {
+	var opts runtime.LogOptions
+	if raw := q.Get("tail"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 || n > maxLogTailQuery {
+			return opts, fmt.Sprintf("tail inválido (inteiro entre 0 e %d)", maxLogTailQuery)
+		}
+		opts.Tail = n
+	}
+	if raw := q.Get("since"); raw != "" {
+		ts, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return opts, "since inválido (esperado RFC3339)"
+		}
+		opts.Since = ts
+	}
+	return opts, ""
+}
+
+// toLogsResponse mapeia as linhas do runtime para o DTO. Carimbos zero (não parseáveis)
+// viram string vazia (omitida no JSON), nunca o "zero time" 0001-01-01.
+func toLogsResponse(lines []runtime.LogLine) logsResponse {
+	out := make([]logLineResponse, 0, len(lines))
+	for _, l := range lines {
+		var ts string
+		if !l.Timestamp.IsZero() {
+			ts = l.Timestamp.UTC().Format(time.RFC3339Nano)
+		}
+		out = append(out, logLineResponse{Timestamp: ts, Message: l.Message})
+	}
+	return logsResponse{Lines: out}
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -341,6 +422,136 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// maxCustomDomains limita quantos domínios próprios um app pode ter — bound no
+// tamanho do fragmento e no número de certs ACME que um único app dispara.
+const maxCustomDomains = 10
+
+// maxDomainLength é o teto de um nome DNS (RFC 1035): 253 octetos.
+const maxDomainLength = 253
+
+// dnsResolveTimeout limita a pré-validação de DNS dos domínios custom.
+const dnsResolveTimeout = 5 * time.Second
+
+// handleSetDomains define a lista COMPLETA de domínios custom de um app (semântica de
+// replace: o que vier no corpo passa a ser o conjunto de domínios próprios; o
+// subdomínio padrão <id>.<base> é sempre mantido). Lista vazia limpa os customs.
+// Cada domínio é validado (formato, não pode estar sob o base-domain, sem duplicata)
+// e pré-checado no DNS antes de registrar a rota — evita o Caddy martelar ACME num
+// domínio que ainda não aponta para a box.
+func (s *Server) handleSetDomains(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	var req setDomainsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "corpo JSON inválido")
+		return
+	}
+
+	id := r.PathValue("id")
+	inst, err := s.rt.Get(r.Context(), id)
+	if err != nil {
+		s.fail(w, "get", err)
+		return
+	}
+	if inst == nil {
+		writeError(w, http.StatusNotFound, "recurso não encontrado")
+		return
+	}
+	if inst.Kind != runtime.KindApp {
+		writeError(w, http.StatusBadRequest, "domínios custom só se aplicam a apps")
+		return
+	}
+
+	// O subdomínio padrão é a âncora da rota; sem roteamento ligado não há onde anexar.
+	base := s.appDomain(inst)
+	if base == "" {
+		writeError(w, http.StatusConflict, "roteamento público desligado neste agent")
+		return
+	}
+	if inst.HostPort == 0 {
+		writeError(w, http.StatusConflict, "app sem porta publicada; suba o app antes de definir domínios")
+		return
+	}
+
+	customs, msg := s.normalizeCustomDomains(req.Domains, base)
+	if msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+
+	// Pré-valida o DNS de cada domínio custom: 422 se ainda não aponta para a box.
+	// Cada domínio tem seu próprio orçamento de timeout — um resolver lento num
+	// domínio não rouba o tempo dos demais (HIGH-1 do review).
+	for _, d := range customs {
+		ctx, cancel := context.WithTimeout(r.Context(), dnsResolveTimeout)
+		msg := s.checkDomainDNS(ctx, d)
+		cancel()
+		if msg != "" {
+			writeError(w, http.StatusUnprocessableEntity, msg)
+			return
+		}
+	}
+
+	// Reescreve a rota com o subdomínio padrão + os customs (idempotente).
+	domains := append([]string{base}, customs...)
+	if err := s.router.Upsert(r.Context(), inst.ID, domains, inst.HostPort); err != nil {
+		s.fail(w, "set-domains", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.toResponse(r.Context(), inst))
+}
+
+// normalizeCustomDomains valida e normaliza a lista de domínios custom (lowercase,
+// formato DNS, não pode estar sob o base-domain gerenciado, sem duplicata, dentro do
+// limite). Devolve a lista limpa e uma mensagem de erro (string vazia = ok). Lista de
+// entrada vazia é válida e significa "limpar os domínios custom".
+func (s *Server) normalizeCustomDomains(in []string, base string) ([]string, string) {
+	if len(in) > maxCustomDomains {
+		return nil, fmt.Sprintf("máximo de %d domínios custom por app", maxCustomDomains)
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		d := strings.ToLower(strings.TrimSpace(raw))
+		if d == "" {
+			return nil, "domínio custom vazio"
+		}
+		if len(d) > maxDomainLength || !reCustomDomain.MatchString(d) {
+			return nil, "domínio custom em formato inválido: " + d
+		}
+		// Domínios sob o base-domain da plataforma são gerenciados pelo agent (wildcard
+		// + subdomínio padrão); aceitá-los como "custom" colidiria com essa gestão.
+		if d == s.cfg.AppsBaseDomain || strings.HasSuffix(d, "."+s.cfg.AppsBaseDomain) {
+			return nil, "domínio sob " + s.cfg.AppsBaseDomain + " é gerenciado pela plataforma: " + d
+		}
+		if d == base {
+			return nil, "domínio custom não pode repetir o subdomínio padrão: " + d
+		}
+		if _, dup := seen[d]; dup {
+			return nil, "domínio custom duplicado: " + d
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	return out, ""
+}
+
+// checkDomainDNS resolve o domínio e confere se ele aponta para a box. Devolve uma
+// mensagem de erro (string vazia = ok). Com AppsPublicIP configurado, exige que um
+// dos endereços resolvidos seja esse IP; sem ele, exige apenas que o domínio resolva.
+func (s *Server) checkDomainDNS(ctx context.Context, domain string) string {
+	addrs, err := s.resolveHost(ctx, domain)
+	if err != nil || len(addrs) == 0 {
+		return "o domínio " + domain + " não resolve no DNS; aponte-o para a box antes de adicioná-lo"
+	}
+	if s.cfg.AppsPublicIP == "" {
+		return ""
+	}
+	if slices.Contains(addrs, s.cfg.AppsPublicIP) {
+		return ""
+	}
+	return fmt.Sprintf("o domínio %s não aponta para a box (%s); ajuste o registro A no seu DNS", domain, s.cfg.AppsPublicIP)
 }
 
 // handleCreateBuild valida o corpo, lança o build assíncrono e responde 202 com o
@@ -455,7 +666,7 @@ func toBuildResponse(st *builder.Status) buildResponse {
 }
 
 // toResponse mapeia a instância do runtime para o DTO, montando a connection URL.
-func (s *Server) toResponse(inst *runtime.Instance) resourceResponse {
+func (s *Server) toResponse(ctx context.Context, inst *runtime.Instance) resourceResponse {
 	resp := resourceResponse{
 		ID:     inst.ID,
 		Kind:   string(inst.Kind),
@@ -492,7 +703,42 @@ func (s *Server) toResponse(inst *runtime.Instance) resourceResponse {
 			}
 		}
 	}
+	if customs := s.customDomains(ctx, inst); len(customs) > 0 {
+		resp.Metadata["customDomains"] = customs
+	}
 	return resp
+}
+
+// customDomains devolve os domínios próprios atualmente roteados para o app (os
+// domínios do fragmento menos o subdomínio padrão). Best-effort: erro de leitura do
+// fragmento vira lista vazia — não falha a resposta inteira por causa da metadata.
+func (s *Server) customDomains(ctx context.Context, inst *runtime.Instance) []string {
+	if inst.Kind != runtime.KindApp {
+		return nil
+	}
+	base := s.appDomain(inst)
+	if base == "" {
+		return nil
+	}
+	all, err := s.router.Domains(ctx, inst.ID)
+	if err != nil {
+		// Best-effort: só loga (a metadata é opcional, a resposta principal segue).
+		s.log.Warn("ler domínios do fragmento falhou", "id", inst.ID, "err", err)
+		return nil
+	}
+	if len(all) == 0 {
+		return nil
+	}
+	customs := make([]string, 0, len(all))
+	for _, d := range all {
+		if d != base {
+			customs = append(customs, d)
+		}
+	}
+	if len(customs) == 0 {
+		return nil
+	}
+	return customs
 }
 
 // toMetricsResponse mapeia a amostra do runtime para o DTO. CollectedAt vira RFC3339

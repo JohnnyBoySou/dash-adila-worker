@@ -93,6 +93,22 @@ type Metrics struct {
 	CollectedAt      time.Time
 }
 
+// LogOptions parametriza a coleta de logs de runtime de um container.
+type LogOptions struct {
+	// Tail é o máximo de linhas (a partir do fim) a devolver. 0 = default do agent.
+	Tail int
+	// Since corta as linhas anteriores a este instante. Zero = sem corte temporal.
+	Since time.Time
+}
+
+// LogLine é uma linha de log de runtime já separada do carimbo de tempo do daemon.
+type LogLine struct {
+	// Timestamp é o instante da linha (do carimbo `--timestamps`); zero se não parseável.
+	Timestamp time.Time
+	// Message é o conteúdo da linha sem o carimbo de tempo.
+	Message string
+}
+
 // ContainerRuntime é o contrato que a camada api usa. Implementações: Docker (real)
 // e Fake (testes).
 type ContainerRuntime interface {
@@ -114,4 +130,7 @@ type ContainerRuntime interface {
 	// Best-effort: campos que dependem de exec (DiskBytes/Keys) ficam zerados quando
 	// a coleta falha, sem que o método inteiro falhe.
 	Metrics(ctx context.Context, id string) (*Metrics, error)
+	// Logs coleta as linhas de log de runtime (stdout+stderr) do container, da mais
+	// antiga para a mais recente, limitadas por opts. ErrNotFound se não existe.
+	Logs(ctx context.Context, id string, opts LogOptions) ([]LogLine, error)
 }

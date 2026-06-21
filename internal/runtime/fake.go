@@ -162,6 +162,27 @@ func (f *Fake) Metrics(_ context.Context, id string) (*Metrics, error) {
 	}, nil
 }
 
+// Logs devolve linhas sintéticas determinísticas para uma instância existente, ou
+// ErrNotFound se o recurso não existe — espelhando a semântica do Docker. Respeita
+// o Tail (recorta as últimas N linhas) para exercitar o caminho de paginação nos testes.
+func (f *Fake) Logs(_ context.Context, id string, opts LogOptions) ([]LogLine, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.instances[id]; !ok {
+		return nil, ErrNotFound
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	lines := []LogLine{
+		{Timestamp: base, Message: "servidor iniciado"},
+		{Timestamp: base.Add(time.Second), Message: "escutando na porta 8080"},
+		{Timestamp: base.Add(2 * time.Second), Message: "requisição processada"},
+	}
+	if opts.Tail > 0 && opts.Tail < len(lines) {
+		lines = lines[len(lines)-opts.Tail:]
+	}
+	return lines, nil
+}
+
 func clone(in *Instance) *Instance {
 	if in == nil {
 		return nil

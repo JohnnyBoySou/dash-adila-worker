@@ -64,6 +64,7 @@ func main() {
 		DefaultPgVersion:    cfg.DefaultPgVersion,
 		DefaultRedisVersion: cfg.DefaultRedisVersion,
 		AppsBaseDomain:      cfg.AppsBaseDomain,
+		AppsPublicIP:        cfg.AppsPublicIP,
 	}, log, routerOpts...)
 
 	httpServer := &http.Server{
