@@ -21,6 +21,10 @@ type Fake struct {
 	// metrics guarda overrides por id para Metrics(). Sem override, sintetiza valores
 	// determinísticos. Usado para controlar o sinal de atividade nos testes do idle-stop.
 	metrics map[string]*Metrics
+
+	// DeletedVolumes registra os ids passados a DeleteVolume — os testes do handler
+	// asseguram que o control plane propagou a exclusão ao runtime.
+	DeletedVolumes []string
 }
 
 func NewFake() *Fake {
@@ -111,6 +115,15 @@ func (f *Fake) Delete(_ context.Context, id string, _ bool) error {
 		delete(f.instances, id)
 	}
 	return nil // idempotente: não-existe → nil
+}
+
+// DeleteVolume registra o id e é sempre idempotente — o fake não modela volumes
+// nomeados, só comprova que a camada api encaminhou a exclusão ao runtime.
+func (f *Fake) DeleteVolume(_ context.Context, volumeID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.DeletedVolumes = append(f.DeletedVolumes, volumeID)
+	return nil
 }
 
 // ListRunning devolve todas as instâncias com status running. Usado pelo idle-stop

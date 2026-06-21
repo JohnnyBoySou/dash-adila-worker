@@ -51,6 +51,12 @@ var (
 	// env key (kind=app): nome de variável de ambiente estilo shell. O VALOR é livre
 	// (pode ser PEM multilinha, JSON, etc.) — exec por slice torna "KEY=VALUE" seguro.
 	reEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+	// mountPath (kind=app): caminho absoluto do volume dentro do container. Sem `:`
+	// (separador do `-v`), sem espaço/newline. A travessia (`..`) é barrada à parte.
+	reMountPath = regexp.MustCompile(`^/[A-Za-z0-9._/-]{0,254}$`)
+	// volumeID: id estável do volume no control plane. Compõe o nome do volume Docker
+	// (`adila-<id>-data`), então restringe-se ao charset seguro de nome de volume.
+	reVolumeID = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 
 	// customDomain: domínio próprio que o usuário aponta para a box (ex.: "lp.adila.co",
 	// "exemplo.com"). Rótulos DNS minúsculos separados por ponto, ≥2 rótulos. Mesma
@@ -140,6 +146,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/resources/{id}/stop", s.requireAuth(s.handleStop))
 	mux.HandleFunc("POST /v1/resources/{id}/start", s.requireAuth(s.handleStart))
 	mux.HandleFunc("DELETE /v1/resources/{id}", s.requireAuth(s.handleDelete))
+	// Volumes persistentes: o control plane apaga um volume nomeado quando o usuário
+	// o exclui (ciclo de vida independente do container do app).
+	mux.HandleFunc("DELETE /v1/volumes/{id}", s.requireAuth(s.handleDeleteVolume))
 	// Domínios custom de um app: define a lista completa de domínios próprios que
 	// passam a rotear para o app (além do subdomínio padrão), com TLS automático.
 	mux.HandleFunc("PUT /v1/resources/{id}/domains", s.requireAuth(s.handleSetDomains))
@@ -285,12 +294,36 @@ func applyAppSpec(spec *runtime.Spec, req createResourceRequest) string {
 			return "env contém nome de variável inválido: " + k
 		}
 	}
+	if len(req.Volumes) > maxVolumesPerApp {
+		return "volumes acima do limite por app"
+	}
+	seenMount := make(map[string]struct{}, len(req.Volumes))
+	volumes := make([]runtime.VolumeMount, 0, len(req.Volumes))
+	for _, v := range req.Volumes {
+		if !reVolumeID.MatchString(v.ID) {
+			return "volume com id inválido: " + v.ID
+		}
+		// `..` permitiria escapar do mountpoint; a regex já barra `:` e espaços.
+		if !reMountPath.MatchString(v.MountPath) || strings.Contains(v.MountPath, "..") {
+			return "volume com mountPath inválido: " + v.MountPath
+		}
+		if _, dup := seenMount[v.MountPath]; dup {
+			return "volume com mountPath duplicado: " + v.MountPath
+		}
+		seenMount[v.MountPath] = struct{}{}
+		volumes = append(volumes, runtime.VolumeMount{ID: v.ID, MountPath: v.MountPath})
+	}
 	spec.Image = req.Image
 	spec.Env = req.Env
 	spec.ContainerPort = req.ContainerPort
 	spec.Command = req.Command
+	spec.Volumes = volumes
 	return ""
 }
+
+// maxVolumesPerApp limita quantos discos persistentes um app pode declarar — teto de
+// borda contra um corpo abusivo. Espelha a expectativa do control plane.
+const maxVolumesPerApp = 20
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -420,6 +453,22 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, "delete-route", err)
 			return
 		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDeleteVolume remove um volume persistente pelo id estável. Valida o formato do
+// id na borda (compõe o nome do volume Docker) e delega ao runtime. Idempotente:
+// volume inexistente → 204, igual ao delete de recurso.
+func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !reVolumeID.MatchString(id) {
+		writeError(w, http.StatusBadRequest, "id de volume inválido")
+		return
+	}
+	if err := s.rt.DeleteVolume(r.Context(), id); err != nil {
+		s.fail(w, "delete-volume", err)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

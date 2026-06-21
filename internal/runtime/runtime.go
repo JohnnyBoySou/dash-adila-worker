@@ -49,6 +49,19 @@ type Spec struct {
 	Env           map[string]string // variáveis de ambiente injetadas no container
 	ContainerPort int               // porta que o container expõe (default 8080)
 	Command       []string          // override do CMD da imagem (opcional)
+	// Volumes são discos persistentes montados no container. Vazio = app stateless
+	// (default). Cada mount usa um volume Docker nomeado pelo ID estável do volume no
+	// control plane, então os dados sobrevivem aos redeploys (que recriam o container
+	// sob uma nova IdempotencyKey).
+	Volumes []VolumeMount
+}
+
+// VolumeMount descreve um disco persistente a montar num app (Kind == KindApp). ID é
+// o identificador estável do volume no control plane — vira o nome do volume Docker
+// (volumeName). MountPath é o caminho absoluto dentro do container.
+type VolumeMount struct {
+	ID        string
+	MountPath string
 }
 
 // Instance é o estado observável de um recurso. O status é SEMÂNTICO — distingue
@@ -123,6 +136,10 @@ type ContainerRuntime interface {
 	Start(ctx context.Context, id string) error
 	// Delete destrói o recurso (e o volume, se destroyData). Idempotente: não-existe → nil.
 	Delete(ctx context.Context, id string, destroyData bool) error
+	// DeleteVolume remove um volume persistente nomeado pelo seu id estável. Usado
+	// pelo control plane quando um volume é excluído explicitamente (independente do
+	// ciclo de vida do container). Idempotente: não-existe → nil.
+	DeleteVolume(ctx context.Context, volumeID string) error
 	// ListRunning devolve todos os containers gerenciados com status running.
 	// Usado pelo idle-stop e pelo backup para encontrar alvos.
 	ListRunning(ctx context.Context) ([]*Instance, error)

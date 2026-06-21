@@ -21,6 +21,15 @@ type createResourceRequest struct {
 	Env           map[string]string `json:"env"`           // variáveis de ambiente
 	ContainerPort int               `json:"containerPort"` // porta do container (default 8080)
 	Command       []string          `json:"command"`       // override CMD
+	Volumes       []volumeMountReq  `json:"volumes"`       // discos persistentes a montar
+}
+
+// volumeMountReq é um disco persistente declarado no deploy de um app. ID é o id
+// estável do volume no control plane (vira o nome do volume Docker); MountPath é o
+// caminho absoluto dentro do container. Espelha o item de `volumes` no TS.
+type volumeMountReq struct {
+	ID        string `json:"id"`
+	MountPath string `json:"mountPath"`
 }
 
 // setDomainsRequest é o corpo de PUT /v1/resources/{id}/domains. Define a lista

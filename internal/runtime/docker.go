@@ -304,6 +304,7 @@ func (d *Docker) createOrFindApp(ctx context.Context, spec Spec) (*Instance, err
 	if spec.CPUs > 0 {
 		args = append(args, "--cpus", strconv.FormatFloat(spec.CPUs, 'f', -1, 64))
 	}
+	args = append(args, appVolumeArgs(spec.Volumes)...)
 	args = append(args, serverlessLabels(spec)...)
 	// A imagem do app já vem completa (ex.: ghcr.io/user/repo:sha), não "repo:version".
 	args = append(args, spec.Image)
@@ -357,6 +358,15 @@ func (d *Docker) Delete(ctx context.Context, id string, destroyData bool) error 
 		if _, err := d.run(ctx, "volume", "rm", volumeName(id)); err != nil && !isNoSuchObject(err) {
 			return err
 		}
+	}
+	return nil
+}
+
+// DeleteVolume remove o volume Docker nomeado pelo id estável do volume. Idempotente:
+// volume inexistente (incluindo o que nunca chegou a ser montado por um deploy) → nil.
+func (d *Docker) DeleteVolume(ctx context.Context, volumeID string) error {
+	if _, err := d.run(ctx, "volume", "rm", volumeName(volumeID)); err != nil && !isNoSuchObject(err) {
+		return err
 	}
 	return nil
 }
@@ -821,6 +831,19 @@ func ContainerName(id string) string { return containerName(id) }
 func containerName(id string) string { return "adila-" + id }
 func volumeName(id string) string    { return "adila-" + id + "-data" }
 func label(key, value string) string { return labelPrefix + key + "=" + value }
+
+// appVolumeArgs monta os pares `-v <volume-nomeado>:<mountPath>` para os discos
+// persistentes de um app. Cada volume é nomeado pelo seu id estável (volumeName), não
+// pelo id do container — como cada deploy recria o container sob nova IdempotencyKey,
+// só o nome estável faz os dados sobreviverem aos redeploys. Função pura (testável sem
+// daemon). Docker cria o volume nomeado on-the-fly se ainda não existir.
+func appVolumeArgs(volumes []VolumeMount) []string {
+	args := make([]string, 0, len(volumes)*2)
+	for _, v := range volumes {
+		args = append(args, "-v", volumeName(v.ID)+":"+v.MountPath)
+	}
+	return args
+}
 
 // serverlessLabels devolve os labels de scale-to-zero quando o Spec pede serverless.
 // Vazio para recursos provisioned (que o idle-stop nunca para). O timeout só é gravado
